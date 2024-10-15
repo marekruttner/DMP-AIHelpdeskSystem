@@ -10,10 +10,10 @@ from halo import Halo  # Halo for terminal progress indicators
 # Connect to Milvus
 connections.connect("default", host="localhost", port="19530")
 
-# Define Milvus collection schema (Removed metadata to avoid issues)
+# Define Milvus collection schema (Updated to 1024 dimensions)
 fields = [
-    FieldSchema(name="document_id", dtype=DataType.INT64, is_primary=True, auto_id=True),  # auto_id=True allows Milvus to generate IDs automatically
-    FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=768),  # assuming embeddings are 768-dimensional
+    FieldSchema(name="document_id", dtype=DataType.INT64, is_primary=True, auto_id=True),
+    FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=1024),  # Updated to 1024 dimensions
 ]
 schema = CollectionSchema(fields, description="Document Embeddings")
 
@@ -94,6 +94,32 @@ def create_document_node(doc_id, content, metadata):
         CREATE (d:Document {doc_id: $doc_id, content: $content, metadata: $metadata_json})
         """, doc_id=doc_id, content=content, metadata_json=metadata_json)
 
+# Create relationship between similar documents in Neo4j (Precomputed)
+def create_similarity_relationship(doc_id_1, doc_id_2, similarity_score):
+    with driver.session() as session:
+        session.run("""
+        MATCH (d1:Document {doc_id: $doc_id_1}), (d2:Document {doc_id: $doc_id_2})
+        CREATE (d1)-[:SIMILAR_TO {score: $similarity_score, type: 'PRECOMPUTED'}]->(d2)
+        """, doc_id_1=doc_id_1, doc_id_2=doc_id_2, similarity_score=similarity_score)
+
+# Function to compute cosine similarity
+def cosine_similarity(embedding1, embedding2):
+    return sum(a * b for a, b in zip(embedding1, embedding2)) / (
+            (sum(a ** 2 for a in embedding1) ** 0.5) * (sum(b ** 2 for b in embedding2) ** 0.5)
+    )
+
+# Compute and store similarities for documents
+def compute_similarity_and_store(doc_id, embedding, doc_ids, embeddings):
+    for i, existing_embedding in enumerate(embeddings):
+        existing_doc_id = doc_ids[i]
+        similarity_score = cosine_similarity(embedding, existing_embedding)
+
+        if similarity_score > similarity_threshold:
+            create_similarity_relationship(doc_id, existing_doc_id, similarity_score)
+
+# Similarity threshold for precomputed relationships
+similarity_threshold = 0.75  # Can be adjusted as needed
+
 # Initialize Ollama embeddings
 embedding_model = OllamaEmbeddings(model="mxbai-embed-large")
 
@@ -101,6 +127,7 @@ embedding_model = OllamaEmbeddings(model="mxbai-embed-large")
 def process_documents(directory):
     docs = []
     embeddings = []
+    doc_ids = []
 
     # Clear the Neo4j graph before processing
     clear_neo4j_graph()
@@ -131,17 +158,23 @@ def process_documents(directory):
                 with Halo(text=f"Generating embedding for document {doc_id}...", spinner="dots") as spinner:
                     embedding = embedding_model.embed_documents([content])[0]
 
-                    # Check if the embedding has the correct length (768)
-                    if len(embedding) != 768:
-                        raise ValueError(f"Embedding size mismatch: expected 768, got {len(embedding)} for document {doc_id}")
+                    # Check if the embedding has the correct length (1024)
+                    if len(embedding) != 1024:
+                        raise ValueError(
+                            f"Embedding size mismatch: expected 1024, got {len(embedding)} for document {doc_id}")
 
                     embeddings.append(embedding)
+                    doc_ids.append(doc_id)
+
                     spinner.succeed(f"Embedding generated for document {doc_id}.")
 
                 # Store document metadata in Neo4j
                 with Halo(text=f"Storing metadata for document {doc_id} in Neo4j...", spinner="dots") as spinner:
                     create_document_node(doc_id, content, metadata)
                     spinner.succeed(f"Metadata stored for document {doc_id} in Neo4j.")
+
+                # Compute similarity with other documents and store relationships
+                compute_similarity_and_store(doc_id, embedding, doc_ids, embeddings)
 
         except Exception as e:
             print(f"Error processing file {file_path}: {e}")
