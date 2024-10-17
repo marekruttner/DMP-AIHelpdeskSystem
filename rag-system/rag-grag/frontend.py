@@ -24,62 +24,61 @@ def get_relevant_docs(query):
     spinner = Halo(text='Searching for relevant documents...', spinner='dots')
     spinner.start()
 
-    # Step 1: Define search parameters and search in Milvus for the top-k similar embeddings
-    search_params = {"metric_type": "COSINE", "params": {"ef": 128}}  # Adjust "ef" as per your requirement
+    # Step 1: Milvus search remains the same
+    search_params = {"metric_type": "COSINE", "params": {"ef": 128}}
     search_results = collection.search(
         data=[query_embedding],
         anns_field="embedding",
-        param=search_params,  # Search parameters
+        param=search_params,
         limit=5,
-        output_fields=["document_id"]  # Removed "metadata" to avoid the error
+        output_fields=["document_id"]
     )
-
-    # Extract the document IDs from search results
-    relevant_docs = [result.id for result in search_results[0]]  # Accessing 'id' directly from the Hit object
-
+    initial_relevant_docs = [hit.id for hit in search_results[0]]
     spinner.succeed("Relevant documents found.")
 
-    # Step 2: Retrieve the document content from Neo4j for relevant documents
-    document_contents = []
-    spinner.start("Fetching document contents from Neo4j...")
-    for doc_id in relevant_docs:
-        with driver.session() as session:
-            result = session.run("""
-            MATCH (d:Document {doc_id: $doc_id})
-            RETURN d.content AS content
-            """, doc_id=doc_id)
-            for record in result:
-                document_contents.append(record['content'])  # Collect document content
+    # Use a set to avoid duplicates
+    relevant_doc_ids = set(initial_relevant_docs)
 
-    spinner.succeed("Document contents retrieved.")
-
-    # Step 3: Retrieve static (precomputed) related documents from Neo4j
-    spinner.start("Searching for precomputed related documents in Neo4j...")
-    for doc_id in relevant_docs:
-        with driver.session() as session:
-            result = session.run("""
-            MATCH (d:Document {doc_id: $doc_id})-[:SIMILAR_TO {type: 'PRECOMPUTED'}]->(related:Document)
-            RETURN related.doc_id
-            """, doc_id=doc_id)
-            relevant_docs.extend([record['related.doc_id'] for record in result])
-
+    # Step 2: Fetch precomputed related documents in batch
+    spinner.start("Fetching precomputed related documents from Neo4j...")
+    with driver.session() as session:
+        result = session.run("""
+        MATCH (d:Document)-[:SIMILAR_TO {type: 'PRECOMPUTED'}]->(related:Document)
+        WHERE d.doc_id IN $doc_ids
+        RETURN related.doc_id AS doc_id
+        """, doc_ids=list(relevant_doc_ids))
+        for record in result:
+            relevant_doc_ids.add(record['doc_id'])
     spinner.succeed("Precomputed related documents retrieved.")
 
-    # Step 4: Dynamically find additional relationships based on query context
-    spinner.start("Dynamically finding additional relationships in Neo4j...")
-    for doc_id in relevant_docs:
-        with driver.session() as session:
-            result = session.run("""
-            MATCH (d:Document {doc_id: $doc_id})-[:SIMILAR_TO]->(related:Document)
-            WHERE related.doc_id <> $doc_id AND NOT EXISTS { MATCH (d)-[:SIMILAR_TO {type: 'PRECOMPUTED'}]->(related) }
-            RETURN related.doc_id
-            """, doc_id=doc_id)
-            relevant_docs.extend([record['related.doc_id'] for record in result])
-
+    # Step 3: Fetch dynamically related documents in batch
+    spinner.start("Fetching dynamically related documents from Neo4j...")
+    with driver.session() as session:
+        result = session.run("""
+        MATCH (d:Document)-[:SIMILAR_TO]->(related:Document)
+        WHERE d.doc_id IN $doc_ids AND related.doc_id <> d.doc_id AND NOT EXISTS {
+            MATCH (d)-[:SIMILAR_TO {type: 'PRECOMPUTED'}]->(related)
+        }
+        RETURN related.doc_id AS doc_id
+        """, doc_ids=list(relevant_doc_ids))
+        for record in result:
+            relevant_doc_ids.add(record['doc_id'])
     spinner.succeed("Dynamically related documents retrieved.")
 
-    return document_contents  # Return document contents instead of IDs
+    # Step 4: Fetch all document contents in a single query
+    spinner.start("Fetching document contents from Neo4j...")
+    document_contents = []
+    with driver.session() as session:
+        result = session.run("""
+        MATCH (d:Document)
+        WHERE d.doc_id IN $doc_ids
+        RETURN d.content AS content
+        """, doc_ids=list(relevant_doc_ids))
+        for record in result:
+            document_contents.append(record['content'])
+    spinner.succeed("Document contents retrieved.")
 
+    return document_contents
 
 # Chat functionality
 llm = Ollama(model="llama3.1:8b")
@@ -87,24 +86,42 @@ conversation_history = []
 
 
 def generate_response(query):
+    # Fetch relevant documents
     relevant_docs_content = get_relevant_docs(query)
-    context = "\n".join(relevant_docs_content)  # Combine document contents into the context
+
+    # Limit the number of documents (e.g., top 3)
+    max_docs = 3
+    relevant_docs_content = relevant_docs_content[:max_docs]
+
+    # Optionally, summarize each document if they are long
+    # For this example, we'll assume documents are short
+
+    # Combine document contents into the context
+    context = "\n".join(relevant_docs_content)
 
     conversation = "\n".join([f"User: {q}\nAI: {r}" for q, r in conversation_history])
 
     prompt = f"""
-    You are a helpdesk assistant that helps the user based on information from provided documents. 
-    Expect that user have some difficulties and need your help so have kind tone voice. 
-    
+    You are a helpdesk assistant that helps the user based on information from provided documents.
+    Expect that user have some difficulties and need your help so have kind tone voice.
+
     In the context you have informations from documents and use them for answering.
-    
 
     FOLLOW THESE INSTRUCTIONS:
-    - use same language as is on the input
-    - ask user for detail informations if you can not answer clearly
+    - Use the same language as the input.
+    - Ask the user for detailed information if you cannot answer clearly.
 
+    Previous conversation:
+    {conversation}
 
-    \n\nPrevious conversation: {conversation}\n\nContext: {context}\n\nQuestion: {query}\nYour kind helpful Answer:"""
+    Context:
+    {context}
+
+    Question:
+    {query}
+
+    Your kind helpful Answer:
+    """
 
     spinner = Halo(text='Generating response...', spinner='dots')
     spinner.start()

@@ -10,10 +10,10 @@ from halo import Halo  # Halo for terminal progress indicators
 # Connect to Milvus
 connections.connect("default", host="localhost", port="19530")
 
-# Define Milvus collection schema (Updated to 1024 dimensions)
+# Define Milvus collection schema with auto_id=False
 fields = [
-    FieldSchema(name="document_id", dtype=DataType.INT64, is_primary=True, auto_id=True),
-    FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=1024),  # Updated to 1024 dimensions
+    FieldSchema(name="document_id", dtype=DataType.INT64, is_primary=True, auto_id=False),
+    FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=1024),
 ]
 schema = CollectionSchema(fields, description="Document Embeddings")
 
@@ -79,10 +79,15 @@ def clear_neo4j_graph():
             session.run("MATCH (n) DETACH DELETE n")
             spinner.succeed("Neo4j graph cleared successfully.")
 
-# Store embeddings in Milvus (only embeddings, metadata handled separately)
-def store_embeddings(embeddings):
-    # Insert data into Milvus: only embedding list
-    collection.insert([embeddings])
+# Function to generate consistent document IDs
+def generate_doc_id(content):
+    sha256_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
+    doc_id = int(sha256_hash, 16) % (2 ** 63 - 1)
+    return doc_id
+
+# Modify store_embeddings to accept doc_ids
+def store_embeddings(doc_ids, embeddings):
+    collection.insert([doc_ids, embeddings])
     collection.flush()
 
 # Store graph relationships and metadata in Neo4j
@@ -118,7 +123,7 @@ def compute_similarity_and_store(doc_id, embedding, doc_ids, embeddings):
             create_similarity_relationship(doc_id, existing_doc_id, similarity_score)
 
 # Similarity threshold for precomputed relationships
-similarity_threshold = 0.75  # Can be adjusted as needed
+similarity_threshold = 0.7  # Can be adjusted as needed
 
 # Initialize Ollama embeddings
 embedding_model = OllamaEmbeddings(model="mxbai-embed-large")
@@ -150,7 +155,7 @@ def process_documents(directory):
 
             # Process each document
             for doc in new_docs:
-                doc_id = hash(doc.page_content)  # Unique document ID based on content
+                doc_id = generate_doc_id(doc.page_content)
                 content = doc.page_content
                 metadata = doc.metadata  # Metadata stored in Neo4j
 
@@ -182,7 +187,7 @@ def process_documents(directory):
     # Store all embeddings in Milvus at once
     if embeddings:
         with Halo(text=f"Storing {len(embeddings)} documents in Milvus...", spinner="dots") as spinner:
-            store_embeddings(embeddings)
+            store_embeddings(doc_ids, embeddings)
             spinner.succeed(f"Stored {len(embeddings)} documents successfully in Milvus.")
     else:
         print("No documents to store.")
