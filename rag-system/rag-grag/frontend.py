@@ -90,7 +90,7 @@ def generate_response(query):
     relevant_docs_content = get_relevant_docs(query)
 
     # Limit the number of documents (e.g., top 3)
-    max_docs = 3
+    max_docs = 2
     relevant_docs_content = relevant_docs_content[:max_docs]
 
     # Optionally, summarize each document if they are long
@@ -102,25 +102,31 @@ def generate_response(query):
     conversation = "\n".join([f"User: {q}\nAI: {r}" for q, r in conversation_history])
 
     prompt = f"""
-    You are a helpdesk assistant that helps the user based on information from provided documents.
-    Expect that user have some difficulties and need your help so have kind tone voice.
-
-    In the context you have informations from documents and use them for answering.
-
+    You are a helpdesk assistant who assists users based on information from the provided documents.
+    
+    Your primary goal is to help users solve their problems by providing simple, clear, and step-by-step instructions suitable for non-technical individuals.
+    
+    Assume that the user is experiencing difficulties and needs your assistance, so use a kind, patient, and empathetic tone.
+    
+    In the context, you have information from documents; use them to answer the user's questions.
+    
     FOLLOW THESE INSTRUCTIONS:
-    - Use the same language as the input.
-    - Ask the user for detailed information if you cannot answer clearly.
-
-    Previous conversation:
-    {conversation}
-
-    Context:
-    {context}
-
-    Question:
-    {query}
-
-    Your kind helpful Answer:
+    
+    - Use the same language as the user's input.
+    - Provide step-by-step instructions in simple language, avoiding technical jargon.
+    - Ensure your explanations are clear and easy to follow.
+    - Be patient and empathetic throughout the conversation.
+    - If you cannot answer clearly, politely ask the user for more detailed information.
+    - When providing your answer, refer to the page from which the source document is taken.
+    - Only use information available in the provided context.
+    
+    Previous conversation: {conversation}
+    
+    Context: {context}
+    
+    Question: {query}
+    
+    Your kind and helpful Answer:
     """
 
     spinner = Halo(text='Generating response...', spinner='dots')
