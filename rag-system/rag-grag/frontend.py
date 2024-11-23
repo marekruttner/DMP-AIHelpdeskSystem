@@ -1,8 +1,9 @@
 from pymilvus import Collection, connections
-from langchain_community.llms import Ollama
-from langchain_community.embeddings import OllamaEmbeddings
 from neo4j import GraphDatabase
-from halo import Halo  # For spinner animations
+from halo import Halo
+from transformers import AutoTokenizer, AutoModel
+import torch
+from langchain_community.llms import Ollama
 
 # Connect to Milvus and Neo4j
 connections.connect("default", host="localhost", port="19530")
@@ -14,17 +15,26 @@ neo4j_user = "neo4j"
 neo4j_password = "testtest"
 driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
 
-# Initialize Ollama embeddings
-embedding_model = OllamaEmbeddings(model="mxbai-embed-large")
+# Initialize Hugging Face model
+model_name = "Seznam/simcse-dist-mpnet-paracrawl-cs-en"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModel.from_pretrained(model_name)
 
+# Function to generate embeddings
+def generate_embedding(text):
+    inputs = tokenizer(text, padding=True, truncation=True, return_tensors='pt', max_length=128)
+    with torch.no_grad():
+        outputs = model(**inputs)
+        embeddings = outputs.last_hidden_state[:, 0, :].numpy().flatten()
+    return embeddings
 
 def get_relevant_docs(query):
-    query_embedding = embedding_model.embed_query(query)
+    query_embedding = generate_embedding(query)
 
     spinner = Halo(text='Searching for relevant documents...', spinner='dots')
     spinner.start()
 
-    # Step 1: Milvus search remains the same
+    # Step 1: Milvus search
     search_params = {"metric_type": "COSINE", "params": {"ef": 128}}
     search_results = collection.search(
         data=[query_embedding],
@@ -33,7 +43,7 @@ def get_relevant_docs(query):
         limit=5,
         output_fields=["document_id"]
     )
-    initial_relevant_docs = [hit.id for hit in search_results[0]]
+    initial_relevant_docs = [hit.entity.get("document_id") for hit in search_results[0]]
     spinner.succeed("Relevant documents found.")
 
     # Use a set to avoid duplicates
@@ -81,20 +91,17 @@ def get_relevant_docs(query):
     return document_contents
 
 # Chat functionality
+
 llm = Ollama(model="llama3.1:8b")
 conversation_history = []
-
 
 def generate_response(query):
     # Fetch relevant documents
     relevant_docs_content = get_relevant_docs(query)
 
-    # Limit the number of documents (e.g., top 3)
+    # Limit the number of documents (e.g., top 2)
     max_docs = 2
     relevant_docs_content = relevant_docs_content[:max_docs]
-
-    # Optionally, summarize each document if they are long
-    # For this example, we'll assume documents are short
 
     # Combine document contents into the context
     context = "\n".join(relevant_docs_content)
@@ -103,29 +110,29 @@ def generate_response(query):
 
     prompt = f"""
     You are a helpdesk assistant who assists users based on information from the provided documents.
-    
+
     Your primary goal is to help users solve their problems by providing simple, clear, and step-by-step instructions suitable for non-technical individuals.
-    
+
     Assume that the user is experiencing difficulties and needs your assistance, so use a kind, patient, and empathetic tone.
-    
+
     In the context, you have information from documents; use them to answer the user's questions.
-    
+
     FOLLOW THESE INSTRUCTIONS:
-    
+
     - Use the same language as the user's input.
     - Provide step-by-step instructions in simple language, avoiding technical jargon.
     - Ensure your explanations are clear and easy to follow.
     - Be patient and empathetic throughout the conversation.
     - If you cannot answer clearly, politely ask the user for more detailed information.
-    - When providing your answer, refer to the page from which the source document is taken.
+    - When providing your answer, refer to the page from which the source document is taken. URL of ducument.
     - Only use information available in the provided context.
-    
+
     Previous conversation: {conversation}
-    
+
     Context: {context}
-    
+
     Question: {query}
-    
+
     Your kind and helpful Answer:
     """
 
@@ -135,7 +142,6 @@ def generate_response(query):
     spinner.succeed("Response generated.")
     conversation_history.append((query, response))
     return response
-
 
 # Start chat
 def chat():
@@ -147,7 +153,6 @@ def chat():
             break
         response = generate_response(query)
         print(f"\n#################\nAI: {response}\n")
-
 
 if __name__ == "__main__":
     chat()

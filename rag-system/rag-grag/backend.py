@@ -1,11 +1,11 @@
 import os
 import hashlib
-import json  # For stringifying metadata if necessary
+import json
 from pymilvus import Collection, connections, FieldSchema, CollectionSchema, DataType, Index, IndexType, utility
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
-from langchain_community.embeddings import OllamaEmbeddings
 from neo4j import GraphDatabase
-from halo import Halo  # Halo for terminal progress indicators
+from halo import Halo
+from transformers import AutoTokenizer, AutoModel
+import torch
 
 # Connect to Milvus
 connections.connect("default", host="localhost", port="19530")
@@ -13,7 +13,7 @@ connections.connect("default", host="localhost", port="19530")
 # Define Milvus collection schema with auto_id=False
 fields = [
     FieldSchema(name="document_id", dtype=DataType.INT64, is_primary=True, auto_id=False),
-    FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=1024),
+    FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=256),
 ]
 schema = CollectionSchema(fields, description="Document Embeddings")
 
@@ -49,6 +49,12 @@ neo4j_user = "neo4j"
 neo4j_password = "testtest"
 driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
 
+
+model_name = "Seznam/simcse-dist-mpnet-paracrawl-cs-en"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModel.from_pretrained(model_name)
+
+
 # Function to rename long file names
 def rename_long_filename(file_path, max_length=255):
     if len(file_path) > max_length:
@@ -64,13 +70,13 @@ def rename_long_filename(file_path, max_length=255):
 
 # Load PDF files
 def load_pdf(file_path):
-    loader = PyPDFLoader(file_path)
-    return loader.load()
+    # Implement your PDF loading logic here
+    pass
 
 # Load Markdown files
 def load_md(file_path):
-    loader = TextLoader(file_path)
-    return loader.load()
+    # Implement your Markdown loading logic here
+    pass
 
 # Clear Neo4j graph (all nodes and relationships)
 def clear_neo4j_graph():
@@ -85,7 +91,7 @@ def generate_doc_id(content):
     doc_id = int(sha256_hash, 16) % (2 ** 63 - 1)
     return doc_id
 
-# Modify store_embeddings to accept doc_ids
+# Store embeddings in Milvus
 def store_embeddings(doc_ids, embeddings):
     collection.insert([doc_ids, embeddings])
     collection.flush()
@@ -93,7 +99,6 @@ def store_embeddings(doc_ids, embeddings):
 # Store graph relationships and metadata in Neo4j
 def create_document_node(doc_id, content, metadata):
     with driver.session() as session:
-        # Optional: Stringify metadata if needed
         metadata_json = json.dumps(metadata)
         session.run("""
         CREATE (d:Document {doc_id: $doc_id, content: $content, metadata: $metadata_json})
@@ -109,9 +114,8 @@ def create_similarity_relationship(doc_id_1, doc_id_2, similarity_score):
 
 # Function to compute cosine similarity
 def cosine_similarity(embedding1, embedding2):
-    return sum(a * b for a, b in zip(embedding1, embedding2)) / (
-            (sum(a ** 2 for a in embedding1) ** 0.5) * (sum(b ** 2 for b in embedding2) ** 0.5)
-    )
+    return float(torch.nn.functional.cosine_similarity(
+        torch.tensor(embedding1), torch.tensor(embedding2), dim=0))
 
 # Compute and store similarities for documents
 def compute_similarity_and_store(doc_id, embedding, doc_ids, embeddings):
@@ -125,8 +129,13 @@ def compute_similarity_and_store(doc_id, embedding, doc_ids, embeddings):
 # Similarity threshold for precomputed relationships
 similarity_threshold = 0.7  # Can be adjusted as needed
 
-# Initialize Ollama embeddings
-embedding_model = OllamaEmbeddings(model="mxbai-embed-large")
+# Function to generate embeddings
+def generate_embedding(text):
+    inputs = tokenizer(text, padding=True, truncation=True, return_tensors='pt', max_length=128)
+    with torch.no_grad():
+        outputs = model(**inputs)
+        embeddings = outputs.last_hidden_state[:, 0, :].numpy().flatten()
+    return embeddings
 
 # Embed and store documents
 def process_documents(directory):
@@ -144,29 +153,27 @@ def process_documents(directory):
         try:
             new_docs = []
             with Halo(text=f"Processing file {filename}...", spinner="dots") as spinner:
-                if filename.endswith(".pdf"):
-                    new_docs = load_pdf(file_path)
-                    docs.extend(new_docs)
-                elif filename.endswith(".md"):
-                    new_docs = load_md(file_path)
-                    docs.extend(new_docs)
-
+                # Implement your document loading logic here
+                # For example, if your documents are plain text files:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    new_docs.append({'page_content': content, 'metadata': {'filename': filename}})
                 spinner.succeed(f"File {filename} processed successfully.")
 
             # Process each document
             for doc in new_docs:
-                doc_id = generate_doc_id(doc.page_content)
-                content = doc.page_content
-                metadata = doc.metadata  # Metadata stored in Neo4j
+                doc_id = generate_doc_id(doc['page_content'])
+                content = doc['page_content']
+                metadata = doc['metadata']  # Metadata stored in Neo4j
 
                 # Get embedding from the document content
                 with Halo(text=f"Generating embedding for document {doc_id}...", spinner="dots") as spinner:
-                    embedding = embedding_model.embed_documents([content])[0]
+                    embedding = generate_embedding(content)
 
-                    # Check if the embedding has the correct length (1024)
-                    if len(embedding) != 1024:
+                    # Check if the embedding has the correct length (256)
+                    if len(embedding) != 256:
                         raise ValueError(
-                            f"Embedding size mismatch: expected 1024, got {len(embedding)} for document {doc_id}")
+                            f"Embedding size mismatch: expected 256, got {len(embedding)} for document {doc_id}")
 
                     embeddings.append(embedding)
                     doc_ids.append(doc_id)
@@ -179,7 +186,7 @@ def process_documents(directory):
                     spinner.succeed(f"Metadata stored for document {doc_id} in Neo4j.")
 
                 # Compute similarity with other documents and store relationships
-                compute_similarity_and_store(doc_id, embedding, doc_ids, embeddings)
+                compute_similarity_and_store(doc_id, embedding, doc_ids[:-1], embeddings[:-1])
 
         except Exception as e:
             print(f"Error processing file {file_path}: {e}")

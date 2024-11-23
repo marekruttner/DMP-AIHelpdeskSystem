@@ -2,7 +2,7 @@ version: '3.5'
 
 services:
   etcd:
-    container_name: milvus-etcd
+    container_name: milvus-etcd-cze
     image: quay.io/coreos/etcd:v3.5.5
     environment:
       - ETCD_AUTO_COMPACTION_MODE=revision
@@ -10,7 +10,7 @@ services:
       - ETCD_QUOTA_BACKEND_BYTES=4294967296
       - ETCD_SNAPSHOT_COUNT=50000
     volumes:
-      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/etcd:/etcd
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/etcd-cze:/etcd
     command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
     healthcheck:
       test: ["CMD", "etcdctl", "endpoint", "health"]
@@ -19,7 +19,7 @@ services:
       retries: 3
 
   minio:
-    container_name: milvus-minio
+    container_name: milvus-minio-cze
     image: minio/minio:RELEASE.2023-03-20T20-16-18Z
     environment:
       MINIO_ACCESS_KEY: minioadmin
@@ -28,7 +28,7 @@ services:
       - "9001:9001"
       - "9000:9000"
     volumes:
-      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/minio:/minio_data
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/minio-cze:/minio_data
     command: minio server /minio_data --console-address ":9001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
@@ -37,7 +37,7 @@ services:
       retries: 3
 
   standalone:
-    container_name: milvus-standalone
+    container_name: milvus-standalone-cze
     image: milvusdb/milvus:v2.4.13-gpu
     command: ["milvus", "run", "standalone"]
     security_opt:
@@ -46,7 +46,7 @@ services:
       ETCD_ENDPOINTS: etcd:2379
       MINIO_ADDRESS: minio:9000
     volumes:
-      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/milvus:/var/lib/milvus
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/milvus-cze:/var/lib/milvus
     ports:
       - "19530:19530"
       - "9091:9091"
@@ -62,7 +62,7 @@ services:
       - "minio"
 
   neo4j:
-    container_name: neo4j
+    container_name: neo4j-cze
     image: neo4j:5.5  # You can use any stable version
     environment:
       NEO4J_AUTH: neo4j/testtest  # Default username/password for testing
@@ -70,10 +70,10 @@ services:
       - "7687:7687"  # Neo4j Bolt port for database communication
       - "7474:7474"  # Neo4j browser port for accessing web interface
     volumes:
-      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/neo4j:/data
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/neo4j-cze:/data
     depends_on:
       - "standalone"  # Optional: if you want Neo4j to wait for Milvus to be ready
 
 networks:
   default:
-    name: milvus
+    name: milvus-cze
