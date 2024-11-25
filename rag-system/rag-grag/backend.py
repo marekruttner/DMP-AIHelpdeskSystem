@@ -6,6 +6,7 @@ from neo4j import GraphDatabase
 from halo import Halo
 from transformers import AutoTokenizer, AutoModel
 import torch
+import numpy as np
 
 # Connect to Milvus
 connections.connect("default", host="localhost", port="19530")
@@ -50,7 +51,7 @@ neo4j_password = "testtest"
 driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
 
 
-model_name = "Seznam/simcse-dist-mpnet-paracrawl-cs-en"
+model_name = "Seznam/retromae-small-cs"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModel.from_pretrained(model_name)
 
@@ -93,7 +94,7 @@ def generate_doc_id(content):
 
 # Store embeddings in Milvus
 def store_embeddings(doc_ids, embeddings):
-    collection.insert([doc_ids, embeddings])
+    collection.insert([doc_ids, embeddings.tolist()])
     collection.flush()
 
 # Store graph relationships and metadata in Neo4j
@@ -112,92 +113,102 @@ def create_similarity_relationship(doc_id_1, doc_id_2, similarity_score):
         CREATE (d1)-[:SIMILAR_TO {score: $similarity_score, type: 'PRECOMPUTED'}]->(d2)
         """, doc_id_1=doc_id_1, doc_id_2=doc_id_2, similarity_score=similarity_score)
 
-# Function to compute cosine similarity
-def cosine_similarity(embedding1, embedding2):
-    return float(torch.nn.functional.cosine_similarity(
-        torch.tensor(embedding1), torch.tensor(embedding2), dim=0))
-
-# Compute and store similarities for documents
-def compute_similarity_and_store(doc_id, embedding, doc_ids, embeddings):
-    for i, existing_embedding in enumerate(embeddings):
-        existing_doc_id = doc_ids[i]
-        similarity_score = cosine_similarity(embedding, existing_embedding)
-
-        if similarity_score > similarity_threshold:
-            create_similarity_relationship(doc_id, existing_doc_id, similarity_score)
-
 # Similarity threshold for precomputed relationships
 similarity_threshold = 0.7  # Can be adjusted as needed
 
-# Function to generate embeddings
-def generate_embedding(text):
-    inputs = tokenizer(text, padding=True, truncation=True, return_tensors='pt', max_length=128)
-    with torch.no_grad():
-        outputs = model(**inputs)
-        embeddings = outputs.last_hidden_state[:, 0, :].numpy().flatten()
-    return embeddings
+# Function to generate embeddings for a list of texts
+def generate_embeddings(texts, batch_size=32):
+    all_embeddings = []
+    for i in range(0, len(texts), batch_size):
+        batch_texts = texts[i:i+batch_size]
+        inputs = tokenizer(batch_texts, padding=True, truncation=True, return_tensors='pt', max_length=128)
+        with torch.no_grad():
+            outputs = model(**inputs)
+            embeddings = outputs.last_hidden_state[:, 0, :].numpy()
+        all_embeddings.extend(embeddings)
+    return np.array(all_embeddings)
 
 # Embed and store documents
 def process_documents(directory):
     docs = []
     embeddings = []
     doc_ids = []
+    contents = []
+    metadatas = []
 
     # Clear the Neo4j graph before processing
     clear_neo4j_graph()
 
+    # Collect all documents
     for filename in os.listdir(directory):
         file_path = os.path.join(directory, filename)
         file_path = rename_long_filename(file_path)
 
         try:
-            new_docs = []
             with Halo(text=f"Processing file {filename}...", spinner="dots") as spinner:
-                # Implement your document loading logic here
-                # For example, if your documents are plain text files:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read()
-                    new_docs.append({'page_content': content, 'metadata': {'filename': filename}})
-                spinner.succeed(f"File {filename} processed successfully.")
-
-            # Process each document
-            for doc in new_docs:
-                doc_id = generate_doc_id(doc['page_content'])
-                content = doc['page_content']
-                metadata = doc['metadata']  # Metadata stored in Neo4j
-
-                # Get embedding from the document content
-                with Halo(text=f"Generating embedding for document {doc_id}...", spinner="dots") as spinner:
-                    embedding = generate_embedding(content)
-
-                    # Check if the embedding has the correct length (256)
-                    if len(embedding) != 256:
-                        raise ValueError(
-                            f"Embedding size mismatch: expected 256, got {len(embedding)} for document {doc_id}")
-
-                    embeddings.append(embedding)
+                    doc_id = generate_doc_id(content)
+                    metadata = {'filename': filename}
+                    docs.append({'doc_id': doc_id, 'content': content, 'metadata': metadata})
+                    contents.append(content)
                     doc_ids.append(doc_id)
-
-                    spinner.succeed(f"Embedding generated for document {doc_id}.")
-
-                # Store document metadata in Neo4j
-                with Halo(text=f"Storing metadata for document {doc_id} in Neo4j...", spinner="dots") as spinner:
-                    create_document_node(doc_id, content, metadata)
-                    spinner.succeed(f"Metadata stored for document {doc_id} in Neo4j.")
-
-                # Compute similarity with other documents and store relationships
-                compute_similarity_and_store(doc_id, embedding, doc_ids[:-1], embeddings[:-1])
-
+                    metadatas.append(metadata)
+                spinner.succeed(f"File {filename} processed successfully.")
         except Exception as e:
             print(f"Error processing file {file_path}: {e}")
 
+    # Store document metadata in Neo4j
+    with Halo(text=f"Storing {len(docs)} documents metadata in Neo4j...", spinner="dots") as spinner:
+        for i in range(len(docs)):
+            doc_id = doc_ids[i]
+            content = contents[i]
+            metadata = metadatas[i]
+            create_document_node(doc_id, content, metadata)
+        spinner.succeed(f"Metadata for {len(docs)} documents stored in Neo4j.")
+
+    # Generate embeddings in batches
+    with Halo(text=f"Generating embeddings for {len(contents)} documents...", spinner="dots") as spinner:
+        embeddings = generate_embeddings(contents)
+        spinner.succeed(f"Embeddings generated for {len(contents)} documents.")
+
     # Store all embeddings in Milvus at once
-    if embeddings:
+    if embeddings.any():
         with Halo(text=f"Storing {len(embeddings)} documents in Milvus...", spinner="dots") as spinner:
             store_embeddings(doc_ids, embeddings)
+            collection.flush()
             spinner.succeed(f"Stored {len(embeddings)} documents successfully in Milvus.")
     else:
         print("No documents to store.")
+
+    # Perform similarity search for each document
+    with Halo(text=f"Performing similarity search and storing relationships in Neo4j...", spinner="dots") as spinner:
+        for i in range(len(docs)):
+            doc_id = doc_ids[i]
+            embedding = embeddings[i]
+
+            # Perform similarity search in Milvus
+            search_params = {
+                "metric_type": "COSINE",
+                "params": {"ef": 64}
+            }
+            search_embedding = [embedding.tolist()]
+            res = collection.search(
+                data=search_embedding,
+                anns_field="embedding",
+                param=search_params,
+                limit=10,
+                expr=None,
+                output_fields=["document_id"]
+            )
+            hits = res[0]
+            for hit in hits:
+                similar_doc_id = hit.entity.get('document_id')
+                similarity_score = 1 - hit.distance  # Since distance is 1 - cosine similarity
+                # Exclude self and apply similarity threshold
+                if similar_doc_id != doc_id and similarity_score > similarity_threshold:
+                    create_similarity_relationship(doc_id, similar_doc_id, similarity_score)
+        spinner.succeed("Similarity search and relationships stored in Neo4j.")
 
 # Run the backend process
 if __name__ == "__main__":
