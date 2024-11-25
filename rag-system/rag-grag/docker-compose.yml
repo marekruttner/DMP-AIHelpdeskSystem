@@ -74,6 +74,30 @@ services:
     depends_on:
       - "standalone"  # Optional: if you want Neo4j to wait for Milvus to be ready
 
+  db:
+    image: postgres:15
+    container_name: postgres-cze
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: adminadmin
+      POSTGRES_DB: chatdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: adminadmin
+    ports:
+      - "5050:80"
+    depends_on:
+      - db  # Ensure this points to your PostgreSQL container
+
+
 networks:
   default:
     name: milvus-cze

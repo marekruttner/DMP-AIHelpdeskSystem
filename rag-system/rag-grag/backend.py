@@ -7,6 +7,8 @@ from halo import Halo
 from transformers import AutoTokenizer, AutoModel
 import torch
 import numpy as np
+import re
+from PyPDF2 import PdfReader
 
 # Connect to Milvus
 connections.connect("default", host="localhost", port="19530")
@@ -50,34 +52,10 @@ neo4j_user = "neo4j"
 neo4j_password = "testtest"
 driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
 
-
+# Model setup
 model_name = "Seznam/retromae-small-cs"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModel.from_pretrained(model_name)
-
-
-# Function to rename long file names
-def rename_long_filename(file_path, max_length=255):
-    if len(file_path) > max_length:
-        directory, filename = os.path.split(file_path)
-        hashed_name = hashlib.sha1(filename.encode()).hexdigest()[:10]
-        ext = os.path.splitext(filename)[1]
-        new_filename = f"{hashed_name}{ext}"
-        new_file_path = os.path.join(directory, new_filename)
-        os.rename(file_path, new_file_path)
-        print(f"Renamed '{file_path}' to '{new_file_path}' due to long filename.")
-        return new_file_path
-    return file_path
-
-# Load PDF files
-def load_pdf(file_path):
-    # Implement your PDF loading logic here
-    pass
-
-# Load Markdown files
-def load_md(file_path):
-    # Implement your Markdown loading logic here
-    pass
 
 # Clear Neo4j graph (all nodes and relationships)
 def clear_neo4j_graph():
@@ -105,36 +83,59 @@ def create_document_node(doc_id, content, metadata):
         CREATE (d:Document {doc_id: $doc_id, content: $content, metadata: $metadata_json})
         """, doc_id=doc_id, content=content, metadata_json=metadata_json)
 
-# Create relationship between similar documents in Neo4j (Precomputed)
-def create_similarity_relationship(doc_id_1, doc_id_2, similarity_score):
+# Create relationship between documents in Neo4j
+def create_relationship(doc_id_1, doc_id_2, relationship_type, extra_data=None):
     with driver.session() as session:
-        session.run("""
+        result = session.run("""
         MATCH (d1:Document {doc_id: $doc_id_1}), (d2:Document {doc_id: $doc_id_2})
-        CREATE (d1)-[:SIMILAR_TO {score: $similarity_score, type: 'PRECOMPUTED'}]->(d2)
-        """, doc_id_1=doc_id_1, doc_id_2=doc_id_2, similarity_score=similarity_score)
+        CREATE (d1)-[:RELATED {type: $relationship_type, extra: $extra_data}]->(d2)
+        RETURN d1, d2
+        """, doc_id_1=doc_id_1, doc_id_2=doc_id_2, relationship_type=relationship_type, extra_data=json.dumps(extra_data))
+        if result.peek() is None:
+            print(f"Failed to create relationship: {doc_id_1} -> {doc_id_2}")
 
-# Similarity threshold for precomputed relationships
-similarity_threshold = 0.7  # Can be adjusted as needed
+# Extract links and references from content
+def extract_links_and_references(content, doc_map):
+    links = re.findall(r"\[.*?\]\((.*?)\)", content)
+    relationships = []
+    for link in links:
+        for ref_doc, ref_doc_id in doc_map.items():
+            if link in ref_doc:
+                relationships.append((ref_doc_id, "LINK"))
+    return links, relationships
 
-# Function to generate embeddings for a list of texts
-def generate_embeddings(texts, batch_size=32):
-    all_embeddings = []
-    for i in range(0, len(texts), batch_size):
-        batch_texts = texts[i:i+batch_size]
-        inputs = tokenizer(batch_texts, padding=True, truncation=True, return_tensors='pt', max_length=128)
-        with torch.no_grad():
-            outputs = model(**inputs)
-            embeddings = outputs.last_hidden_state[:, 0, :].numpy()
-        all_embeddings.extend(embeddings)
-    return np.array(all_embeddings)
+# Read content from a file (Markdown or PDF)
+def read_file_content(file_path):
+    if file_path.endswith(".md"):
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    elif file_path.endswith(".pdf"):
+        try:
+            reader = PdfReader(file_path)
+            return "\n".join([page.extract_text() for page in reader.pages])
+        except Exception as e:
+            print(f"Error reading PDF file {file_path}: {e}")
+    return None
+
+# Enrich metadata with more details
+def extract_metadata(file_path, content):
+    metadata = {
+        "filename": os.path.basename(file_path),
+        "size": os.path.getsize(file_path),
+        "word_count": len(content.split()),
+        "links": []
+    }
+    if file_path.endswith(".md"):
+        metadata["type"] = "Markdown"
+    elif file_path.endswith(".pdf"):
+        metadata["type"] = "PDF"
+    return metadata
 
 # Embed and store documents
 def process_documents(directory):
-    docs = []
+    docs = {}
     embeddings = []
     doc_ids = []
-    contents = []
-    metadatas = []
 
     # Clear the Neo4j graph before processing
     clear_neo4j_graph()
@@ -142,79 +143,39 @@ def process_documents(directory):
     # Collect all documents
     for filename in os.listdir(directory):
         file_path = os.path.join(directory, filename)
-        file_path = rename_long_filename(file_path)
-
         try:
-            with Halo(text=f"Processing file {filename}...", spinner="dots") as spinner:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                    doc_id = generate_doc_id(content)
-                    metadata = {'filename': filename}
-                    docs.append({'doc_id': doc_id, 'content': content, 'metadata': metadata})
-                    contents.append(content)
-                    doc_ids.append(doc_id)
-                    metadatas.append(metadata)
-                spinner.succeed(f"File {filename} processed successfully.")
+            content = read_file_content(file_path)
+            if content:
+                doc_id = generate_doc_id(content)
+                metadata = extract_metadata(file_path, content)
+                links, _ = extract_links_and_references(content, docs)
+                metadata["links"] = [link.split("/")[-1] for link in links]  # Extract the file name from the URL
+                docs[filename] = doc_id
+                create_document_node(doc_id, content, metadata)
         except Exception as e:
             print(f"Error processing file {file_path}: {e}")
 
-    # Store document metadata in Neo4j
-    with Halo(text=f"Storing {len(docs)} documents metadata in Neo4j...", spinner="dots") as spinner:
-        for i in range(len(docs)):
-            doc_id = doc_ids[i]
-            content = contents[i]
-            metadata = metadatas[i]
-            create_document_node(doc_id, content, metadata)
-        spinner.succeed(f"Metadata for {len(docs)} documents stored in Neo4j.")
+    # Parse links and references
+    for filename, doc_id in docs.items():
+        file_path = os.path.join(directory, filename)
+        content = read_file_content(file_path)
+        if content:
+            _, relationships = extract_links_and_references(content, docs)
+            for target_doc_id, rel_type in relationships:
+                create_relationship(doc_id, target_doc_id, rel_type, extra_data={"source": filename})
 
-    # Generate embeddings in batches
-    with Halo(text=f"Generating embeddings for {len(contents)} documents...", spinner="dots") as spinner:
-        embeddings = generate_embeddings(contents)
-        spinner.succeed(f"Embeddings generated for {len(contents)} documents.")
-
-    # Store all embeddings in Milvus at once
-    if embeddings.any():
-        with Halo(text=f"Storing {len(embeddings)} documents in Milvus...", spinner="dots") as spinner:
-            store_embeddings(doc_ids, embeddings)
-            collection.flush()
-            spinner.succeed(f"Stored {len(embeddings)} documents successfully in Milvus.")
-    else:
-        print("No documents to store.")
-
-    # Perform similarity search for each document
-    with Halo(text=f"Performing similarity search and storing relationships in Neo4j...", spinner="dots") as spinner:
-        for i in range(len(docs)):
-            doc_id = doc_ids[i]
-            embedding = embeddings[i]
-
-            # Perform similarity search in Milvus
-            search_params = {
-                "metric_type": "COSINE",
-                "params": {"ef": 64}
-            }
-            search_embedding = [embedding.tolist()]
-            res = collection.search(
-                data=search_embedding,
-                anns_field="embedding",
-                param=search_params,
-                limit=10,
-                expr=None,
-                output_fields=["document_id"]
-            )
-            hits = res[0]
-            for hit in hits:
-                similar_doc_id = hit.entity.get('document_id')
-                similarity_score = 1 - hit.distance  # Since distance is 1 - cosine similarity
-                # Exclude self and apply similarity threshold
-                if similar_doc_id != doc_id and similarity_score > similarity_threshold:
-                    create_similarity_relationship(doc_id, similar_doc_id, similarity_score)
-        spinner.succeed("Similarity search and relationships stored in Neo4j.")
-
-# Run the backend process
+# Main function to execute the document processing
 if __name__ == "__main__":
-    # Specify your directory where documents are stored
     directory = "/home/marek/rag-documents/"
-    process_documents(directory)
+    if os.path.isdir(directory):
+        with Halo(text="Starting document processing...", spinner="dots") as spinner:
+            try:
+                process_documents(directory)
+                spinner.succeed("Document processing completed successfully.")
+            except Exception as e:
+                spinner.fail(f"An error occurred during processing: {e}")
+    else:
+        print(f"Invalid directory: {directory}")
 
 # Close Neo4j driver when finished
 driver.close()
