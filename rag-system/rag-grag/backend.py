@@ -72,6 +72,7 @@ def generate_doc_id(content):
 
 # Store embeddings in Milvus
 def store_embeddings(doc_ids, embeddings):
+    embeddings = np.array(embeddings)  # Ensure embeddings is a NumPy array
     collection.insert([doc_ids, embeddings.tolist()])
     collection.flush()
 
@@ -85,6 +86,8 @@ def create_document_node(doc_id, content, metadata):
 
 # Create relationship between documents in Neo4j
 def create_relationship(doc_id_1, doc_id_2, relationship_type, extra_data=None):
+    if extra_data and "score" in extra_data:
+        extra_data["score"] = float(extra_data["score"])  # Ensure float32 is converted to standard float
     with driver.session() as session:
         result = session.run("""
         MATCH (d1:Document {doc_id: $doc_id_1}), (d2:Document {doc_id: $doc_id_2})
@@ -93,6 +96,19 @@ def create_relationship(doc_id_1, doc_id_2, relationship_type, extra_data=None):
         """, doc_id_1=doc_id_1, doc_id_2=doc_id_2, relationship_type=relationship_type, extra_data=json.dumps(extra_data))
         if result.peek() is None:
             print(f"Failed to create relationship: {doc_id_1} -> {doc_id_2}")
+
+# Compute cosine similarity
+def cosine_similarity(embedding1, embedding2):
+    return np.dot(embedding1, embedding2) / (np.linalg.norm(embedding1) * np.linalg.norm(embedding2))
+
+# Compute and store similarities for documents
+def compute_similarity_and_store(doc_id, embedding, doc_ids, embeddings):
+    for i, existing_embedding in enumerate(embeddings):
+        existing_doc_id = doc_ids[i]
+        similarity_score = cosine_similarity(embedding, existing_embedding)
+
+        if similarity_score > 0.7:  # Similarity threshold
+            create_relationship(doc_id, existing_doc_id, "SIMILAR_TO", extra_data={"score": similarity_score})
 
 # Extract links and references from content
 def extract_links_and_references(content, doc_map):
@@ -152,19 +168,71 @@ def process_documents(directory):
                 metadata["links"] = [link.split("/")[-1] for link in links]  # Extract the file name from the URL
                 docs[filename] = doc_id
                 create_document_node(doc_id, content, metadata)
+
+                # Generate embeddings
+                with Halo(text=f"Generating embeddings for {filename}...", spinner="dots") as spinner:
+                    inputs = tokenizer(content, return_tensors="pt", truncation=True, padding=True, max_length=128)
+                    with torch.no_grad():
+                        embedding = model(**inputs).last_hidden_state.mean(dim=1).squeeze().numpy()
+                    embeddings.append(embedding)
+                    doc_ids.append(doc_id)
+                    spinner.succeed(f"Embedding generated for {filename}.")
+
         except Exception as e:
             print(f"Error processing file {file_path}: {e}")
 
-    # Parse links and references
-    for filename, doc_id in docs.items():
-        file_path = os.path.join(directory, filename)
-        content = read_file_content(file_path)
-        if content:
-            _, relationships = extract_links_and_references(content, docs)
-            for target_doc_id, rel_type in relationships:
-                create_relationship(doc_id, target_doc_id, rel_type, extra_data={"source": filename})
+    # Compute similarities and store relationships
+    for i, embedding in enumerate(embeddings):
+        compute_similarity_and_store(doc_ids[i], embedding, doc_ids[:i], embeddings[:i])
 
-# Main function to execute the document processing
+    # Store embeddings in Milvus
+    if embeddings:
+        with Halo(text=f"Storing {len(embeddings)} documents in Milvus...", spinner="dots") as spinner:
+            store_embeddings(doc_ids, embeddings)
+            spinner.succeed(f"Stored {len(embeddings)} documents successfully in Milvus.")
+    else:
+        print("No embeddings to store.")
+
+    # Perform similarity search and update Neo4j with links
+    with Halo(text="Performing similarity searches...", spinner="dots") as spinner:
+        for i, embedding in enumerate(embeddings):
+            search_params = {
+                "metric_type": "COSINE",
+                "params": {"ef": 64}  # Use a high value for accuracy
+            }
+
+            # Search for similar documents in Milvus
+            try:
+                search_results = collection.search(
+                    data=[embedding.tolist()],
+                    anns_field="embedding",
+                    param=search_params,
+                    limit=10,
+                    output_fields=["document_id"]
+                )
+                for result in search_results[0]:
+                    similar_doc_id = result.id
+                    similarity_score = 1 - result.distance  # Convert distance to similarity
+                    if similar_doc_id != doc_ids[i] and similarity_score > 0.7:  # Avoid self-match
+                        create_relationship(
+                            doc_ids[i],
+                            similar_doc_id,
+                            "SIMILAR_TO",
+                            extra_data={"score": similarity_score}
+                        )
+            except Exception as e:
+                print(f"Error during similarity search for document {doc_ids[i]}: {e}")
+        spinner.succeed("Similarity searches completed successfully.")
+
+    # Store links explicitly found in the documents
+    with Halo(text="Storing explicit document links in Neo4j...", spinner="dots") as spinner:
+        for filename, doc_id in docs.items():
+            links, relationships = extract_links_and_references(read_file_content(os.path.join(directory, filename)),
+                                                                docs)
+            for target_doc_id, _ in relationships:
+                create_relationship(doc_id, target_doc_id, "LINK", extra_data={"source": filename})
+        spinner.succeed("Explicit document links stored successfully.")
+
 if __name__ == "__main__":
     directory = "/home/marek/rag-documents/"
     if os.path.isdir(directory):
@@ -176,6 +244,3 @@ if __name__ == "__main__":
                 spinner.fail(f"An error occurred during processing: {e}")
     else:
         print(f"Invalid directory: {directory}")
-
-# Close Neo4j driver when finished
-driver.close()
