@@ -32,7 +32,7 @@ def test_chat(user_id):
     url = f"{BASE_URL}/chat"
     payload = {
         "user_id": user_id,
-        "query": "What is the purpose of a database index?"
+        "query": "Jak se můžu připojit k síti eduroam?"
     }
     response = requests.post(url, json=payload)
     print(f"Response Status Code: {response.status_code}")

@@ -87,7 +87,7 @@ services:
       - ./postgres-data:/var/lib/postgresql/data
 
   pgadmin:
-    image: dpage/pgadmin4
+    image: dpage/pgadmin4:8.13.0
     container_name: pgadmin
     environment:
       PGADMIN_DEFAULT_EMAIL: admin@admin.com

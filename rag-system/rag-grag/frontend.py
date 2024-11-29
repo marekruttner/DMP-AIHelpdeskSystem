@@ -9,11 +9,20 @@ import torch
 import numpy as np
 from langchain_community.llms import Ollama
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 
 # FastAPI app initialization
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins, you can restrict it to specific domains
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all HTTP methods
+    allow_headers=["*"],  # Allow all headers
+)
 
 # PostgreSQL connection
 DB_CONFIG = {
@@ -94,6 +103,24 @@ def save_conversation(user_id, query, response):
         cursor.close()
         connection.close()
 
+# Fetch conversation history for a user
+@app.get("/chat/history/{user_id}")
+def get_chat_history(user_id: int):
+    connection = psycopg2.connect(**DB_CONFIG)
+    cursor = connection.cursor()
+    try:
+        cursor.execute("""
+            SELECT conversation FROM user_conversations WHERE user_id = %s ORDER BY id ASC
+        """, (user_id,))
+        result = cursor.fetchall()
+        history = [record[0] for record in result]
+        return {"history": history}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching chat history: {e}")
+    finally:
+        cursor.close()
+        connection.close()
+
 # Fetch relevant documents
 def get_relevant_docs(query):
     query_embedding = generate_embeddings([query])[0]
@@ -168,17 +195,26 @@ def login_user(credentials: UserCredentials):
 # Chat endpoint
 @app.post("/chat", response_model=ChatResponse)
 def generate_response(request: QueryRequest):
+    if not request.new_chat:
+        # Use conversation history if not starting a new chat
+        conversation = "\n".join([
+            f"User: {q}\nAI: {r}" for q, r in conversation_history[-50:]
+        ])
+    else:
+        conversation = ""  # Start with an empty conversation
+
     documents = get_relevant_docs(request.query)
-    max_docs = 3
+    max_docs = 5
     documents = documents[:max_docs]
 
     context = ""
     for doc in documents:
         content = doc['content']
         filename = doc['filename']
+        content = content.encode('utf-8', errors='replace').decode('utf-8')
+        filename = filename.encode('utf-8', errors='replace').decode('utf-8')
         context += f"{content}\n(Source: {filename})\n\n"
 
-    conversation = "\n".join([f"User: {q}\nAI: {r}" for q, r in conversation_history[-50:]])
     prompt = f"""
         You are a helpdesk assistant who assists users based on information from the provided documents.
 
@@ -196,10 +232,15 @@ def generate_response(request: QueryRequest):
         Your kind and helpful Answer:
     """
 
-    response = llm.invoke(prompt)
-    conversation_history.append((request.query, response))
+    response = llm.invoke(prompt).strip()
+    response = response.encode('utf-8', errors='replace').decode('utf-8')
+
+    if not request.new_chat:
+        conversation_history.append((request.query, response))  # Save to in-memory history
     save_conversation(request.user_id, request.query, response)
 
     source_names = ", ".join([doc['filename'] for doc in documents])
-    response += f"\n\nSources: {source_names}"
-    return {"response": response, "sources": source_names}
+    source_names = source_names.encode('utf-8', errors='replace').decode('utf-8')
+    formatted_response = f"{response}\n\nSources:\n{source_names.replace(',', '\n')}"
+
+    return {"response": formatted_response, "sources": source_names}
