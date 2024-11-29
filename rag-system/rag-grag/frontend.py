@@ -8,10 +8,14 @@ from transformers import AutoTokenizer, AutoModel
 import torch
 import numpy as np
 from langchain_community.llms import Ollama
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Union
+import uuid
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
 
 # FastAPI app initialization
 app = FastAPI()
@@ -51,27 +55,61 @@ model = AutoModel.from_pretrained(model_name)
 
 # Initialize LLM and conversation history
 llm = Ollama(model="llama3.1:8b")
+
+# JWT Configuration
+SECRET_KEY = "your-secure-secret-key"  # Replace with a strong secret key
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
+
 conversation_history = []  # Tracks user queries and responses
 
-# Pydantic models for request/response validation
+# Pydantic models for request validation
 class UserCredentials(BaseModel):
     username: str
     password: str
 
 class QueryRequest(BaseModel):
-    user_id: int
     query: str
+    new_chat: Optional[bool] = True
+    chat_id: Optional[str] = None
 
 class RegistrationResponse(BaseModel):
     message: str
 
 class LoginResponse(BaseModel):
-    user_id: Optional[int]
+    access_token: str
     message: str
 
 class ChatResponse(BaseModel):
     response: str
     sources: Optional[str]
+    chat_id: Optional[str]
+
+###### UTILITIES ######
+
+def create_access_token(data: dict, expires_delta: Union[timedelta, None] = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=401,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise credentials_exception
+        return int(user_id)
+    except JWTError:
+        raise credentials_exception
 
 # Function to generate embeddings for a list of texts
 def generate_embeddings(texts, batch_size=32):
@@ -86,37 +124,19 @@ def generate_embeddings(texts, batch_size=32):
     return np.array(all_embeddings)
 
 # Save conversation to PostgreSQL
-def save_conversation(user_id, query, response):
+def save_conversation(user_id, chat_id, query, response):
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
     try:
         sanitized_query = query.encode("utf-8", "replace").decode("utf-8")
         sanitized_response = response.encode("utf-8", "replace").decode("utf-8")
         cursor.execute("""
-            INSERT INTO user_conversations (user_id, conversation)
-            VALUES (%s, %s)
-        """, (user_id, f"User: {sanitized_query}\nAI: {sanitized_response}"))
+            INSERT INTO user_conversations (user_id, chat_id, conversation)
+            VALUES (%s, %s, %s)
+        """, (user_id, chat_id, f"User: {sanitized_query}\nAI: {sanitized_response}"))
         connection.commit()
     except Exception as e:
         print(f"Error saving conversation: {e}")
-    finally:
-        cursor.close()
-        connection.close()
-
-# Fetch conversation history for a user
-@app.get("/chat/history/{user_id}")
-def get_chat_history(user_id: int):
-    connection = psycopg2.connect(**DB_CONFIG)
-    cursor = connection.cursor()
-    try:
-        cursor.execute("""
-            SELECT conversation FROM user_conversations WHERE user_id = %s ORDER BY id ASC
-        """, (user_id,))
-        result = cursor.fetchall()
-        history = [record[0] for record in result]
-        return {"history": history}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching chat history: {e}")
     finally:
         cursor.close()
         connection.close()
@@ -151,6 +171,48 @@ def get_relevant_docs(query):
             })
     return documents
 
+###### ENDPOINTS ######
+
+# Fetch all chats for a user
+
+@app.get("/chats", response_model=dict)
+def get_user_chats(current_user_id: int = Depends(get_current_user)):
+    connection = psycopg2.connect(**DB_CONFIG)
+    cursor = connection.cursor()
+    try:
+        cursor.execute("""
+            SELECT chat_id, MAX(conversation) AS latest_message
+            FROM user_conversations
+            WHERE user_id = %s
+            GROUP BY chat_id
+            ORDER BY MAX(id) DESC
+        """, (current_user_id,))
+        result = cursor.fetchall()
+        chats = [{"chat_id": row[0], "latest_message": row[1]} for row in result]
+        return {"chats": chats}
+    finally:
+        cursor.close()
+        connection.close()
+
+# Fetch conversation history for a specific chat
+@app.get("/chat/history/{chat_id}", response_model=dict)
+def get_chat_history(chat_id: str, current_user_id: int = Depends(get_current_user)):
+    connection = psycopg2.connect(**DB_CONFIG)
+    cursor = connection.cursor()
+    try:
+        cursor.execute("""
+            SELECT conversation FROM user_conversations 
+            WHERE user_id = %s AND chat_id = %s 
+            ORDER BY id ASC
+        """, (current_user_id, chat_id))
+        result = cursor.fetchall()
+        history = [record[0] for record in result]
+        return {"history": history}
+    finally:
+        cursor.close()
+        connection.close()
+
+
 # User registration endpoint
 @app.post("/register", response_model=RegistrationResponse)
 def register_user(credentials: UserCredentials):
@@ -173,35 +235,54 @@ def register_user(credentials: UserCredentials):
 
 # User login endpoint
 @app.post("/login", response_model=LoginResponse)
-def login_user(credentials: UserCredentials):
+def login_for_access_token(credentials: UserCredentials):
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
-
     try:
-        cursor.execute("""
-            SELECT id, password FROM users WHERE username = %s
-        """, (credentials.username,))
+        cursor.execute("SELECT id, password FROM users WHERE username = %s", (credentials.username,))
         result = cursor.fetchone()
         if result:
             user_id, stored_hash = result
             input_hash = hashlib.sha256(credentials.password.encode()).hexdigest()
             if input_hash == stored_hash:
-                return {"user_id": user_id, "message": "Login successful"}
+                access_token = create_access_token(data={"sub": str(user_id)}, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+                return {"access_token": access_token, "message": "Login successful"}
         raise HTTPException(status_code=401, detail="Invalid username or password")
     finally:
         cursor.close()
         connection.close()
 
+
 # Chat endpoint
 @app.post("/chat", response_model=ChatResponse)
-def generate_response(request: QueryRequest):
-    if not request.new_chat:
-        # Use conversation history if not starting a new chat
-        conversation = "\n".join([
-            f"User: {q}\nAI: {r}" for q, r in conversation_history[-50:]
-        ])
+def generate_response(request: QueryRequest, current_user_id: int = Depends(get_current_user)):
+    # Log the incoming request data
+    print(f"Request received: {request.dict()}")
+
+    if request.new_chat:
+        # Create a new chat_id for a new conversation
+        chat_id = str(uuid.uuid4())
+        conversation = ""  # Start fresh for a new chat
     else:
-        conversation = ""  # Start with an empty conversation
+        # Validate chat_id is provided when not starting a new chat
+        chat_id = request.chat_id
+        if not chat_id:
+            raise HTTPException(status_code=400, detail="chat_id is required when new_chat is False")
+
+        # Fetch conversation history for the chat
+        connection = psycopg2.connect(**DB_CONFIG)
+        cursor = connection.cursor()
+        try:
+            cursor.execute("""
+                SELECT conversation FROM user_conversations WHERE user_id = %s AND chat_id = %s ORDER BY id ASC
+            """, (current_user_id, chat_id))
+            result = cursor.fetchall()
+            conversation = "\n".join([record[0] for record in result])
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error fetching chat history: {e}")
+        finally:
+            cursor.close()
+            connection.close()
 
     documents = get_relevant_docs(request.query)
     max_docs = 5
@@ -235,12 +316,12 @@ def generate_response(request: QueryRequest):
     response = llm.invoke(prompt).strip()
     response = response.encode('utf-8', errors='replace').decode('utf-8')
 
-    if not request.new_chat:
-        conversation_history.append((request.query, response))  # Save to in-memory history
-    save_conversation(request.user_id, request.query, response)
+    save_conversation(current_user_id, chat_id, request.query, response)
 
     source_names = ", ".join([doc['filename'] for doc in documents])
     source_names = source_names.encode('utf-8', errors='replace').decode('utf-8')
     formatted_response = f"{response}\n\nSources:\n{source_names.replace(',', '\n')}"
 
-    return {"response": formatted_response, "sources": source_names}
+    return {"response": formatted_response, "sources": source_names, "chat_id": chat_id}
+
+

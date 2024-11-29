@@ -39,17 +39,13 @@ class LoginScreen extends StatelessWidget {
             ElevatedButton(
               onPressed: () async {
                 try {
-                  final response = await apiService.login(
+                  await apiService.login(
                     usernameController.text,
                     passwordController.text,
                   );
-                  if (response['user_id'] != null) {
-                    Navigator.pushReplacementNamed(context, '/chat');
-                  } else {
-                    // Handle error
-                  }
+                  Navigator.pushReplacementNamed(context, '/chat');
                 } catch (e) {
-                  print(e);
+                  print("Login failed: $e");
                 }
               },
               style: ElevatedButton.styleFrom(

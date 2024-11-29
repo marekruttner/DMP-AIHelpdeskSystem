@@ -10,29 +10,55 @@ class _ChatScreenState extends State<ChatScreen> {
   final TextEditingController messageController = TextEditingController();
   final List<Map<String, dynamic>> messages = [];
   final ApiService apiService = ApiService();
+  List<Map<String, dynamic>> chats = []; // List to store all chats with IDs
+  String? currentChatId; // Currently selected chat ID
+  String? currentChatName; // Currently selected chat name for display
 
   @override
   void initState() {
     super.initState();
-    loadChatHistory();
+    fetchAllChats(); // Fetch all existing chats when the screen loads
   }
 
-  void loadChatHistory() async {
+  Future<void> fetchAllChats() async {
     try {
-      final history = await apiService.getChatHistory(1); // Replace '1' with user_id
+      final chatList = await apiService.getChats(); // No user_id required
       setState(() {
-        for (var convo in history) {
+        chats = chatList
+            .map<Map<String, dynamic>>((chat) => {
+          "chatId": chat['chat_id'],
+          "name": "Chat ${chat['chat_id'].substring(0, 6)}",
+          "latestMessage": chat['latest_message'] ?? "No messages yet"
+        })
+            .toList();
+      });
+    } catch (e) {
+      setState(() {
+        messages.add({"message": "Failed to load chats", "isUser": false});
+      });
+    }
+  }
+
+  void loadChatHistory(String chatId, String chatName) async {
+    try {
+      currentChatId = chatId;
+      currentChatName = chatName;
+
+      final history = await apiService.getChatHistory(chatId); // Only chatId required
+      setState(() {
+        messages.clear();
+        for (var convo in history['history']) {
           messages.add({"message": convo, "isUser": convo.startsWith("User:")});
         }
       });
     } catch (e) {
       setState(() {
-        messages.add({"message": "Chyba: Nelze načíst historii", "isUser": false});
+        messages.add({"message": "Failed to load chat history", "isUser": false});
       });
     }
   }
 
-  void sendMessage({bool newChat = false}) async {
+  Future<void> sendMessage() async {
     String userMessage = messageController.text.trim();
 
     if (userMessage.isEmpty) return;
@@ -44,15 +70,28 @@ class _ChatScreenState extends State<ChatScreen> {
     messageController.clear();
 
     try {
-      final response = await apiService.chat(1, userMessage, newChat: newChat); // Replace '1' with user_id
-      String botMessage = response['response'] ?? "Chyba: Žádná odpověď";
+      bool newChat = currentChatId == null;
+
+      final response = await apiService.chat(
+        userMessage,
+        newChat: newChat,
+        chatId: currentChatId,
+      );
+      String botMessage = response['response'] ?? "No response received";
+
+      if (newChat) {
+        currentChatId = response['chat_id'];
+        currentChatName = "New Chat";
+        await fetchAllChats();
+      }
 
       setState(() {
         messages.add({"message": botMessage, "isUser": false});
       });
     } catch (e) {
+      print("Error: $e");
       setState(() {
-        messages.add({"message": "Chyba: Nelze se připojit k serveru", "isUser": false});
+        messages.add({"message": "Failed to send message", "isUser": false});
       });
     }
   }
@@ -60,6 +99,8 @@ class _ChatScreenState extends State<ChatScreen> {
   void startNewChat() {
     setState(() {
       messages.clear();
+      currentChatId = null;
+      currentChatName = null;
     });
   }
 
@@ -68,17 +109,51 @@ class _ChatScreenState extends State<ChatScreen> {
     return Scaffold(
       appBar: AppBar(
         title: Text(
-          "nTech Chatbot Framework",
+          currentChatName ?? "Select a Chat",
           style: TextStyle(color: Colors.pink, fontSize: 20),
         ),
         backgroundColor: Colors.white,
         elevation: 0,
         actions: [
           IconButton(
-            icon: Icon(Icons.chat_bubble_outline, color: Colors.blue),
-            onPressed: startNewChat,
+            icon: Icon(Icons.add, color: Colors.blue),
+            onPressed: () {
+              startNewChat();
+            },
           ),
         ],
+      ),
+      drawer: Drawer(
+        child: ListView(
+          padding: EdgeInsets.zero,
+          children: [
+            DrawerHeader(
+              decoration: BoxDecoration(color: Colors.pink),
+              child: Text(
+                "Chats",
+                style: TextStyle(color: Colors.white, fontSize: 24),
+              ),
+            ),
+            ...chats.map((chat) {
+              return ListTile(
+                title: Text(chat['name']),
+                subtitle: Text(chat['latestMessage']),
+                onTap: () {
+                  Navigator.pop(context); // Close the drawer
+                  loadChatHistory(chat['chatId'], chat['name']); // Load selected chat
+                },
+              );
+            }).toList(),
+            ListTile(
+              leading: Icon(Icons.add),
+              title: Text("Start New Chat"),
+              onTap: () {
+                Navigator.pop(context); // Close the drawer
+                startNewChat();
+              },
+            ),
+          ],
+        ),
       ),
       body: Column(
         children: [
@@ -102,14 +177,14 @@ class _ChatScreenState extends State<ChatScreen> {
                   child: TextField(
                     controller: messageController,
                     decoration: InputDecoration(
-                      hintText: "Zadejte svou zprávu...",
+                      hintText: "Type your message...",
                       border: OutlineInputBorder(borderRadius: BorderRadius.circular(20)),
                     ),
                   ),
                 ),
                 SizedBox(width: 10),
                 FloatingActionButton(
-                  onPressed: () => sendMessage(),
+                  onPressed: sendMessage,
                   backgroundColor: Colors.pink,
                   child: Icon(Icons.send),
                 ),

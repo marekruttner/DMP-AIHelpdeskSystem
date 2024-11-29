@@ -2,7 +2,7 @@ version: '3.5'
 
 services:
   etcd:
-    container_name: milvus-etcd-cze
+    container_name: milvus-etcd
     image: quay.io/coreos/etcd:v3.5.5
     environment:
       - ETCD_AUTO_COMPACTION_MODE=revision
@@ -19,7 +19,7 @@ services:
       retries: 3
 
   minio:
-    container_name: milvus-minio-cze
+    container_name: milvus-minio
     image: minio/minio:RELEASE.2023-03-20T20-16-18Z
     environment:
       MINIO_ACCESS_KEY: minioadmin
@@ -37,7 +37,7 @@ services:
       retries: 3
 
   standalone:
-    container_name: milvus-standalone-cze
+    container_name: milvus-standalone
     image: milvusdb/milvus:v2.4.13-gpu
     command: ["milvus", "run", "standalone"]
     security_opt:
@@ -62,7 +62,7 @@ services:
       - "minio"
 
   neo4j:
-    container_name: neo4j-cze
+    container_name: neo4j
     image: neo4j:5.5  # You can use any stable version
     environment:
       NEO4J_AUTH: neo4j/testtest  # Default username/password for testing
@@ -76,15 +76,24 @@ services:
 
   db:
     image: postgres:15
-    container_name: postgres-cze
+    container_name: postgres
     environment:
       POSTGRES_USER: admin
       POSTGRES_PASSWORD: adminadmin
       POSTGRES_DB: chatdb
+      POSTGRES_HOST_AUTH_METHOD: trust
     ports:
       - "5432:5432"
     volumes:
       - ./postgres-data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - default
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U admin" ]
+      interval: 30s
+      timeout: 20s
+      retries: 5
 
   pgadmin:
     image: dpage/pgadmin4:8.13.0
