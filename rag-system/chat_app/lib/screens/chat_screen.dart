@@ -44,11 +44,21 @@ class _ChatScreenState extends State<ChatScreen> {
       currentChatId = chatId;
       currentChatName = chatName;
 
-      final history = await apiService.getChatHistory(chatId); // Only chatId required
+      final history = await apiService.getChatHistory(chatId); // Fetch chat history
       setState(() {
         messages.clear();
         for (var convo in history['history']) {
-          messages.add({"message": convo, "isUser": convo.startsWith("User:")});
+          if (convo.startsWith("User:")) {
+            messages.add({
+              "message": convo.replaceFirst("User:", "").trim(),
+              "isUser": true,
+            });
+          } else if (convo.startsWith("AI:")) {
+            messages.add({
+              "message": convo.replaceFirst("AI:", "").trim(),
+              "isUser": false,
+            });
+          }
         }
       });
     } catch (e) {
@@ -57,6 +67,7 @@ class _ChatScreenState extends State<ChatScreen> {
       });
     }
   }
+
 
   Future<void> sendMessage() async {
     String userMessage = messageController.text.trim();
@@ -137,7 +148,7 @@ class _ChatScreenState extends State<ChatScreen> {
             ...chats.map((chat) {
               return ListTile(
                 title: Text(chat['name']),
-                subtitle: Text(chat['latestMessage']),
+                //subtitle: Text(chat['latestMessage']),
                 onTap: () {
                   Navigator.pop(context); // Close the drawer
                   loadChatHistory(chat['chatId'], chat['name']); // Load selected chat

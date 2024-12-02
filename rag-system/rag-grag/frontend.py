@@ -206,7 +206,11 @@ def get_chat_history(chat_id: str, current_user_id: int = Depends(get_current_us
             ORDER BY id ASC
         """, (current_user_id, chat_id))
         result = cursor.fetchall()
-        history = [record[0] for record in result]
+        history = []
+        for record in result:
+            # Split by line, e.g., "User: ...\nAI: ..."
+            conversations = record[0].split("\n")
+            history.extend(conversations)
         return {"history": history}
     finally:
         cursor.close()
