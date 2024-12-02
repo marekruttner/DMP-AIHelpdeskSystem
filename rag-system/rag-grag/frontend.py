@@ -125,7 +125,7 @@ def generate_embeddings(texts, batch_size=32):
 
 # Save conversation to PostgreSQL
 def save_conversation(user_id, chat_id, query, response):
-    connection = psycopg2.connect(**DB_CONFIG)
+    connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
     try:
         sanitized_query = query.encode("utf-8", "replace").decode("utf-8")
@@ -177,7 +177,7 @@ def get_relevant_docs(query):
 
 @app.get("/chats", response_model=dict)
 def get_user_chats(current_user_id: int = Depends(get_current_user)):
-    connection = psycopg2.connect(**DB_CONFIG)
+    connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
     try:
         cursor.execute("""
@@ -197,7 +197,7 @@ def get_user_chats(current_user_id: int = Depends(get_current_user)):
 # Fetch conversation history for a specific chat
 @app.get("/chat/history/{chat_id}", response_model=dict)
 def get_chat_history(chat_id: str, current_user_id: int = Depends(get_current_user)):
-    connection = psycopg2.connect(**DB_CONFIG)
+    connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
     try:
         cursor.execute("""
@@ -220,7 +220,7 @@ def get_chat_history(chat_id: str, current_user_id: int = Depends(get_current_us
 # User registration endpoint
 @app.post("/register", response_model=RegistrationResponse)
 def register_user(credentials: UserCredentials):
-    connection = psycopg2.connect(**DB_CONFIG)
+    connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
 
     hashed_password = hashlib.sha256(credentials.password.encode()).hexdigest()
@@ -240,7 +240,7 @@ def register_user(credentials: UserCredentials):
 # User login endpoint
 @app.post("/login", response_model=LoginResponse)
 def login_for_access_token(credentials: UserCredentials):
-    connection = psycopg2.connect(**DB_CONFIG)
+    connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
     try:
         cursor.execute("SELECT id, password FROM users WHERE username = %s", (credentials.username,))
@@ -274,7 +274,7 @@ def generate_response(request: QueryRequest, current_user_id: int = Depends(get_
             raise HTTPException(status_code=400, detail="chat_id is required when new_chat is False")
 
         # Fetch conversation history for the chat
-        connection = psycopg2.connect(**DB_CONFIG)
+        connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
         cursor = connection.cursor()
         try:
             cursor.execute("""

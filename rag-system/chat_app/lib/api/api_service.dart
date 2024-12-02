@@ -34,11 +34,11 @@ class ApiService {
     );
 
     if (response.statusCode == 200) {
-      final data = json.decode(response.body);
+      final data = json.decode(utf8.decode(response.bodyBytes)); // Ensure UTF-8 decoding
       setToken(data['access_token']); // Save the token here
       print('Token saved: $_token'); // Debug token
     } else {
-      final errorData = json.decode(response.body);
+      final errorData = json.decode(utf8.decode(response.bodyBytes)); // Ensure UTF-8 decoding
       throw Exception(errorData['detail'] ?? 'Failed to login');
     }
   }
@@ -54,7 +54,7 @@ class ApiService {
     if (response.statusCode == 200) {
       print('Registration successful'); // Debug success
     } else {
-      final errorData = json.decode(response.body);
+      final errorData = json.decode(utf8.decode(response.bodyBytes)); // Ensure UTF-8 decoding
       throw Exception(errorData['detail'] ?? 'Failed to register');
     }
   }
@@ -64,7 +64,7 @@ class ApiService {
     print('Headers in getChats: $headers'); // Debug headers
     final response = await http.get(Uri.parse('$baseUrl/chats'), headers: headers);
     if (response.statusCode == 200) {
-      final data = json.decode(response.body);
+      final data = json.decode(utf8.decode(response.bodyBytes)); // Ensure UTF-8 decoding
       return data['chats'] ?? [];
     } else {
       throw Exception('Failed to load chats');
@@ -76,7 +76,7 @@ class ApiService {
     print('Headers in getChatHistory: $headers'); // Debug headers
     final response = await http.get(Uri.parse('$baseUrl/chat/history/$chatId'), headers: headers);
     if (response.statusCode == 200) {
-      return json.decode(response.body);
+      return json.decode(utf8.decode(response.bodyBytes)); // Ensure UTF-8 decoding
     } else {
       throw Exception('Failed to load chat history');
     }
@@ -95,7 +95,7 @@ class ApiService {
     );
 
     if (response.statusCode == 200) {
-      return json.decode(response.body);
+      return json.decode(utf8.decode(response.bodyBytes)); // Ensure UTF-8 decoding
     } else {
       throw Exception('Failed to send chat message');
     }
