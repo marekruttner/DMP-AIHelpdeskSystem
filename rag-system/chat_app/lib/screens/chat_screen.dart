@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:chat_app/api/api_service.dart';
 
 class ChatScreen extends StatefulWidget {
@@ -10,9 +11,10 @@ class _ChatScreenState extends State<ChatScreen> {
   final TextEditingController messageController = TextEditingController();
   final List<Map<String, dynamic>> messages = [];
   final ApiService apiService = ApiService();
-  List<Map<String, dynamic>> chats = []; // List to store all chats with IDs
-  String? currentChatId; // Currently selected chat ID
-  String? currentChatName; // Currently selected chat name for display
+  final ScrollController _scrollController = ScrollController(); // Scroll controller for chat
+  List<Map<String, dynamic>> chats = [];
+  String? currentChatId;
+  String? currentChatName;
 
   @override
   void initState() {
@@ -22,7 +24,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> fetchAllChats() async {
     try {
-      final chatList = await apiService.getChats(); // No user_id required
+      final chatList = await apiService.getChats();
       setState(() {
         chats = chatList
             .map<Map<String, dynamic>>((chat) => {
@@ -44,30 +46,59 @@ class _ChatScreenState extends State<ChatScreen> {
       currentChatId = chatId;
       currentChatName = chatName;
 
-      final history = await apiService.getChatHistory(chatId); // Fetch chat history
+      final history = await apiService.getChatHistory(chatId);
+      print("Chat history received: ${history['history']}");
+
       setState(() {
         messages.clear();
+
+        String currentSpeaker = "";
+        StringBuffer currentMessage = StringBuffer();
+
         for (var convo in history['history']) {
           if (convo.startsWith("User:")) {
-            messages.add({
-              "message": convo.replaceFirst("User:", "").trim(),
-              "isUser": true,
-            });
+            if (currentMessage.isNotEmpty) {
+              messages.add({
+                "message": currentMessage.toString().trim(),
+                "isUser": currentSpeaker == "User",
+              });
+              currentMessage.clear();
+            }
+            currentSpeaker = "User";
+            currentMessage.write(convo.replaceFirst("User:", "").trim());
           } else if (convo.startsWith("AI:")) {
-            messages.add({
-              "message": convo.replaceFirst("AI:", "").trim(),
-              "isUser": false,
-            });
+            if (currentMessage.isNotEmpty) {
+              messages.add({
+                "message": currentMessage.toString().trim(),
+                "isUser": currentSpeaker == "User",
+              });
+              currentMessage.clear();
+            }
+            currentSpeaker = "AI";
+            currentMessage.write(convo.replaceFirst("AI:", "").trim());
+          } else {
+            currentMessage.write("\n$convo");
           }
         }
+
+        if (currentMessage.isNotEmpty) {
+          messages.add({
+            "message": currentMessage.toString().trim(),
+            "isUser": currentSpeaker == "User",
+          });
+        }
+
+        print("Parsed messages: $messages");
       });
+
+      _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
     } catch (e) {
+      print("Error loading chat history: $e");
       setState(() {
         messages.add({"message": "Failed to load chat history", "isUser": false});
       });
     }
   }
-
 
   Future<void> sendMessage() async {
     String userMessage = messageController.text.trim();
@@ -99,6 +130,8 @@ class _ChatScreenState extends State<ChatScreen> {
       setState(() {
         messages.add({"message": botMessage, "isUser": false});
       });
+
+      _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
     } catch (e) {
       print("Error: $e");
       setState(() {
@@ -148,10 +181,9 @@ class _ChatScreenState extends State<ChatScreen> {
             ...chats.map((chat) {
               return ListTile(
                 title: Text(chat['name']),
-                //subtitle: Text(chat['latestMessage']),
                 onTap: () {
-                  Navigator.pop(context); // Close the drawer
-                  loadChatHistory(chat['chatId'], chat['name']); // Load selected chat
+                  Navigator.pop(context);
+                  loadChatHistory(chat['chatId'], chat['name']);
                 },
               );
             }).toList(),
@@ -159,7 +191,7 @@ class _ChatScreenState extends State<ChatScreen> {
               leading: Icon(Icons.add),
               title: Text("Start New Chat"),
               onTap: () {
-                Navigator.pop(context); // Close the drawer
+                Navigator.pop(context);
                 startNewChat();
               },
             ),
@@ -170,10 +202,13 @@ class _ChatScreenState extends State<ChatScreen> {
         children: [
           Expanded(
             child: ListView.builder(
+              controller: _scrollController,
+              key: ValueKey(messages.length),
               itemCount: messages.length,
               itemBuilder: (context, index) {
                 final chat = messages[index];
                 return ChatBubble(
+                  key: ValueKey(index),
                   message: chat['message'],
                   isUser: chat['isUser'],
                 );
@@ -212,7 +247,7 @@ class ChatBubble extends StatelessWidget {
   final String message;
   final bool isUser;
 
-  const ChatBubble({required this.message, required this.isUser});
+  const ChatBubble({Key? key, required this.message, required this.isUser}) : super(key: key);
 
   @override
   Widget build(BuildContext context) {
@@ -225,12 +260,27 @@ class ChatBubble extends StatelessWidget {
           color: isUser ? Colors.pink[100] : Colors.grey[200],
           borderRadius: BorderRadius.circular(15),
         ),
-        child: Text(
-          message,
+        child: isUser
+            ? Text(
+          message, // Plain text for user messages
           style: TextStyle(fontSize: 16, height: 1.5),
-          textDirection: TextDirection.ltr, // Ensures proper text rendering
+          textDirection: TextDirection.ltr,
+        )
+            : MarkdownBody(
+          data: message, // Render AI responses as Markdown
+          styleSheet: MarkdownStyleSheet(
+            p: TextStyle(fontSize: 16, height: 1.5),
+            listBullet: TextStyle(fontSize: 16, height: 1.5),
+          ),
+          onTapLink: (text, href, title) {
+            if (href != null) {
+              // Handle link taps (e.g., open in a browser)
+              print("Tapped link: $href");
+            }
+          },
         ),
       ),
     );
   }
 }
+
