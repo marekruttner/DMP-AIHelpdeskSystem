@@ -36,23 +36,25 @@ app.add_middleware(
 
 # PostgreSQL connection
 DB_CONFIG = {
-    "dbname": "chatdb",
-    "user": "admin",
-    "password": "adminadmin",
-    "host": "localhost",  # Use the service name from docker-compose
-    "port": "5432"
+    "dbname": os.getenv("DB_NAME"),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
+    "host": os.getenv("DB_HOST"),
+    "port": os.getenv("DB_PORT"),
 }
 
 # Connect to Milvus
-connections.connect("default", host="localhost", port="19530")
+MILVUS_HOST = os.getenv("MILVUS_HOST")
+MILVUS_PORT = os.getenv("MILVUS_PORT")
+connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
 collection = Collection("document_embeddings")
 collection.load()
 
 # Connect to Neo4j
-neo4j_uri = "bolt://localhost:7687"
-neo4j_user = "neo4j"
-neo4j_password = "testtest"
-driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
+NEO4J_URI = os.getenv("NEO4J_URI")
+NEO4J_USER = os.getenv("NEO4J_USER")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
 # Initialize Hugging Face model
 model_name = "Seznam/retromae-small-cs"
@@ -63,15 +65,15 @@ model = AutoModel.from_pretrained(model_name)
 llm = Ollama(model="llama3.1:8b")
 
 # JWT Configuration
-SECRET_KEY = "your-secure-secret-key"  # Replace with a strong secret key
+SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
 
 # Slack Bot configuration
-SLACK_BOT_TOKEN = "xoxb-434148724417-8117844679300-ETFM5pmIHUi1RG1JyzJr8Bin"
-SLACK_SIGNING_SECRET = "603f7c86a1c053afe989b7316a1cae96"
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 
