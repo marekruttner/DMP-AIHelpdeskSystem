@@ -4,3 +4,4 @@ rag-system/scraper/scraped_markdown/
 rag-system/rag-grag/volumes/
 rag-system/rag-grag/postgres-data/
 rag-system/rag-grag/__pycache__/
+rag-system/rag-grag/.env
