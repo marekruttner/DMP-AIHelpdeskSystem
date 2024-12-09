@@ -1,103 +1,188 @@
 import 'dart:convert';
+import 'dart:io';
 import 'package:http/http.dart' as http;
 
 class ApiService {
-  // Singleton implementation
   static final ApiService _instance = ApiService._internal();
-
-  factory ApiService() {
-    return _instance;
-  }
-
+  factory ApiService() => _instance;
   ApiService._internal();
 
-  final String baseUrl = 'http://localhost:8000'; // Replace with your server's base URL
-  String? _token; // JWT token storage
+  final String baseUrl = 'http://localhost:8000'; // Update with your server URL
+  String? _token;
+  String? _role; // Store user role if needed
 
-  // Set the token after login
   void setToken(String token) {
     _token = token;
   }
 
-  // Headers with token
-  Map<String, String> get headers => {
-    'Content-Type': 'application/json',
-    if (_token != null) 'Authorization': 'Bearer $_token',
-  };
+  void setRole(String role) {
+    _role = role;
+  }
 
-  // Login function to fetch and store token
+  String? get currentUserRole => _role;
+
+  Map<String, String> get authHeaders {
+    final headers = <String, String>{};
+    if (_token != null) {
+      headers['Authorization'] = 'Bearer $_token';
+    }
+    return headers;
+  }
+
+  /// LOGIN using form data (POST /login)
   Future<void> login(String username, String password) async {
     final response = await http.post(
       Uri.parse('$baseUrl/login'),
-      headers: {'Content-Type': 'application/json'},
-      body: json.encode({'username': username, 'password': password}),
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: 'username=${Uri.encodeQueryComponent(username)}&password=${Uri.encodeQueryComponent(password)}',
     );
 
     if (response.statusCode == 200) {
-      final data = json.decode(utf8.decode(response.bodyBytes)); // Ensure UTF-8 decoding
-      setToken(data['access_token']); // Save the token here
-      print('Token saved: $_token'); // Debug token
+      final data = json.decode(utf8.decode(response.bodyBytes));
+      setToken(data['access_token']);
+      // If your backend returns user role on login, set it here:
+      // setRole(data['role']);
     } else {
-      final errorData = json.decode(utf8.decode(response.bodyBytes)); // Ensure UTF-8 decoding
+      final errorData = json.decode(utf8.decode(response.bodyBytes));
       throw Exception(errorData['detail'] ?? 'Failed to login');
     }
   }
 
-  // Registration function
+  /// REGISTER using form data (POST /register)
   Future<void> register(String username, String password) async {
     final response = await http.post(
       Uri.parse('$baseUrl/register'),
-      headers: {'Content-Type': 'application/json'},
-      body: json.encode({'username': username, 'password': password}),
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: 'username=${Uri.encodeQueryComponent(username)}&password=${Uri.encodeQueryComponent(password)}',
     );
 
     if (response.statusCode == 200) {
-      print('Registration successful'); // Debug success
+      print('Registration successful');
     } else {
-      final errorData = json.decode(utf8.decode(response.bodyBytes)); // Ensure UTF-8 decoding
+      final errorData = json.decode(utf8.decode(response.bodyBytes));
       throw Exception(errorData['detail'] ?? 'Failed to register');
     }
   }
 
-  // Fetch chats
+  /// GET CHATS (GET /chats)
   Future<List<dynamic>> getChats() async {
-    print('Headers in getChats: $headers'); // Debug headers
-    final response = await http.get(Uri.parse('$baseUrl/chats'), headers: headers);
+    final response = await http.get(Uri.parse('$baseUrl/chats'), headers: authHeaders);
     if (response.statusCode == 200) {
-      final data = json.decode(utf8.decode(response.bodyBytes)); // Ensure UTF-8 decoding
+      final data = json.decode(utf8.decode(response.bodyBytes));
       return data['chats'] ?? [];
     } else {
       throw Exception('Failed to load chats');
     }
   }
 
-  // Fetch chat history
+  /// GET CHAT HISTORY (GET /chat/history/{chat_id})
   Future<Map<String, dynamic>> getChatHistory(String chatId) async {
-    print('Headers in getChatHistory: $headers'); // Debug headers
-    final response = await http.get(Uri.parse('$baseUrl/chat/history/$chatId'), headers: headers);
+    final response = await http.get(Uri.parse('$baseUrl/chat/history/$chatId'), headers: authHeaders);
     if (response.statusCode == 200) {
-      return json.decode(utf8.decode(response.bodyBytes)); // Ensure UTF-8 decoding
+      return json.decode(utf8.decode(response.bodyBytes));
     } else {
       throw Exception('Failed to load chat history');
     }
   }
 
-  // Send chat message
+  /// CHAT (POST /chat) - Sends a query to the assistant
   Future<Map<String, dynamic>> chat(String query, {required bool newChat, String? chatId}) async {
     final body = {'query': query, 'new_chat': newChat};
     if (chatId != null) body['chat_id'] = chatId;
 
-    print('Headers in chat: $headers'); // Debug headers
     final response = await http.post(
       Uri.parse('$baseUrl/chat'),
-      headers: headers,
+      headers: {
+        ...authHeaders,
+        'Content-Type': 'application/json'
+      },
       body: json.encode(body),
     );
 
     if (response.statusCode == 200) {
-      return json.decode(utf8.decode(response.bodyBytes)); // Ensure UTF-8 decoding
+      return json.decode(utf8.decode(response.bodyBytes));
     } else {
       throw Exception('Failed to send chat message');
+    }
+  }
+
+  /// UPDATE ROLE (POST /update-role) - JSON-based
+  Future<void> updateRole(String username, String newRole) async {
+    final payload = {"username": username, "new_role": newRole};
+    final response = await http.post(
+      Uri.parse('$baseUrl/update-role'),
+      headers: {
+        ...authHeaders,
+        'Content-Type': 'application/json'
+      },
+      body: json.encode(payload),
+    );
+
+    if (response.statusCode != 200) {
+      final errorData = json.decode(utf8.decode(response.bodyBytes));
+      throw Exception(errorData['detail'] ?? 'Failed to update role');
+    }
+  }
+
+  /// CREATE WORKSPACE (POST /workspaces) - JSON-based
+  Future<Map<String, dynamic>> createWorkspace(String name) async {
+    final payload = {"name": name};
+    final response = await http.post(
+      Uri.parse('$baseUrl/workspaces'),
+      headers: {
+        ...authHeaders,
+        'Content-Type': 'application/json'
+      },
+      body: json.encode(payload),
+    );
+
+    if (response.statusCode == 200) {
+      return json.decode(utf8.decode(response.bodyBytes));
+    } else {
+      final errorData = json.decode(utf8.decode(response.bodyBytes));
+      throw Exception(errorData['detail'] ?? 'Failed to create workspace');
+    }
+  }
+
+  /// ASSIGN USER TO WORKSPACE (POST /workspaces/{workspace_id}/assign-user) - JSON-based
+  Future<Map<String, dynamic>> assignUserToWorkspace(int workspaceId, int userId) async {
+    final payload = {"user_id": userId};
+    final response = await http.post(
+      Uri.parse('$baseUrl/workspaces/$workspaceId/assign-user'),
+      headers: {
+        ...authHeaders,
+        'Content-Type': 'application/json'
+      },
+      body: json.encode(payload),
+    );
+
+    if (response.statusCode == 200) {
+      return json.decode(utf8.decode(response.bodyBytes));
+    } else {
+      final errorData = json.decode(utf8.decode(response.bodyBytes));
+      throw Exception(errorData['detail'] ?? 'Failed to assign user to workspace');
+    }
+  }
+
+  /// UPLOAD DOCUMENT (POST /documents) - multipart/form-data
+  Future<Map<String, dynamic>> uploadDocument(String filePath, String scope) async {
+    var request = http.MultipartRequest('POST', Uri.parse('$baseUrl/documents'));
+    request.headers.addAll(authHeaders);
+    request.files.add(await http.MultipartFile.fromPath('file', filePath));
+    request.fields['scope'] = scope;
+
+    final streamedResponse = await request.send();
+    final response = await http.Response.fromStream(streamedResponse);
+
+    if (response.statusCode == 200) {
+      return json.decode(utf8.decode(response.bodyBytes));
+    } else {
+      final errorData = json.decode(utf8.decode(response.bodyBytes));
+      throw Exception(errorData['detail'] ?? 'Failed to upload document');
     }
   }
 }

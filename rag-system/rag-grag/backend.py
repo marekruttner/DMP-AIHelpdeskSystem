@@ -78,10 +78,17 @@ def store_embeddings(doc_ids, embeddings):
 
 # Store graph relationships and metadata in Neo4j
 def create_document_node(doc_id, content, metadata):
+    # Mark all documents as global and no workspace_id
+    metadata_json = json.dumps(metadata)
     with driver.session() as session:
-        metadata_json = json.dumps(metadata)
         session.run("""
-        CREATE (d:Document {doc_id: $doc_id, content: $content, metadata: $metadata_json})
+        CREATE (d:Document {
+            doc_id: $doc_id,
+            content: $content,
+            metadata: $metadata_json,
+            is_global: true,
+            workspace_id: null
+        })
         """, doc_id=doc_id, content=content, metadata_json=metadata_json)
 
 # Create relationship between documents in Neo4j
@@ -227,8 +234,7 @@ def process_documents(directory):
     # Store links explicitly found in the documents
     with Halo(text="Storing explicit document links in Neo4j...", spinner="dots") as spinner:
         for filename, doc_id in docs.items():
-            links, relationships = extract_links_and_references(read_file_content(os.path.join(directory, filename)),
-                                                                docs)
+            links, relationships = extract_links_and_references(read_file_content(os.path.join(directory, filename)), docs)
             for target_doc_id, _ in relationships:
                 create_relationship(doc_id, target_doc_id, "LINK", extra_data={"source": filename})
         spinner.succeed("Explicit document links stored successfully.")
