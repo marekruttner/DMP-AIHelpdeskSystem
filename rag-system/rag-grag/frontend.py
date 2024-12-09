@@ -8,9 +8,9 @@ from transformers import AutoTokenizer, AutoModel
 import torch
 import numpy as np
 from langchain_community.llms import Ollama
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, Form, Request  # Added Request
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, Form, Request, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordBearer
 from fastapi.responses import JSONResponse
 from fastapi.background import BackgroundTasks
 from pydantic import BaseModel
@@ -20,19 +20,18 @@ from jose import JWTError, jwt
 from datetime import datetime, timedelta
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
-from slack_sdk.webhook import WebhookClient
 import hmac
-import threading  # Import threading module
+import threading
 
 # FastAPI app initialization
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins, you can restrict it to specific domains
+    allow_origins=["*"],  # Adjust in production
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all HTTP methods
-    allow_headers=["*"],  # Allow all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # PostgreSQL connection
@@ -62,7 +61,7 @@ model_name = "Seznam/retromae-small-cs"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModel.from_pretrained(model_name)
 
-# Initialize LLM and conversation history
+# Initialize LLM
 llm = Ollama(model="llama3.1:8b")
 
 # Create locks for thread safety
@@ -82,45 +81,36 @@ SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 
-# Remove the unused global variable
-# conversation_history = []  # Tracks user queries and responses
-
-# Pydantic models for request validation
 class UserCredentials(BaseModel):
     username: str
     password: str
-
 
 class QueryRequest(BaseModel):
     query: str
     new_chat: Optional[bool] = True
     chat_id: Optional[str] = None
 
-
 class RegistrationResponse(BaseModel):
     message: str
-
 
 class LoginResponse(BaseModel):
     access_token: str
     message: str
-
 
 class ChatResponse(BaseModel):
     response: str
     sources: Optional[str]
     chat_id: Optional[str]
 
+class UpdateRoleRequest(BaseModel):
+    username: str
+    new_role: str
 
-###### UTILITIES ######
+class CreateWorkspaceRequest(BaseModel):
+    name: str
 
-def create_access_token(data: dict, expires_delta: Union[timedelta, None] = None):
-    to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
+class AssignUserRequest(BaseModel):
+    user_id: int
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
@@ -162,12 +152,18 @@ async def get_current_user_with_role(token: str = Depends(oauth2_scheme)):
     except JWTError:
         raise credentials_exception
 
-# Function to generate embeddings for a list of texts
+def create_access_token(data: dict, expires_delta: Union[timedelta, None] = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
 def generate_embeddings(texts, batch_size=32):
     all_embeddings = []
     for i in range(0, len(texts), batch_size):
         batch_texts = texts[i:i + batch_size]
-        with model_lock:  # Ensure thread-safe access to the model
+        with model_lock:
             inputs = tokenizer(batch_texts, padding=True, truncation=True, return_tensors='pt', max_length=128)
             with torch.no_grad():
                 outputs = model(**inputs)
@@ -175,8 +171,6 @@ def generate_embeddings(texts, batch_size=32):
         all_embeddings.extend(embeddings)
     return np.array(all_embeddings)
 
-
-# Save conversation to PostgreSQL
 def save_conversation(user_id, chat_id, query, response):
     connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
@@ -193,70 +187,6 @@ def save_conversation(user_id, chat_id, query, response):
     finally:
         cursor.close()
         connection.close()
-
-
-# Fetch relevant documents
-def get_relevant_docs(query):
-    query_embedding = generate_embeddings([query])[0]
-
-    search_params = {"metric_type": "COSINE", "params": {"ef": 128}}
-    search_results = collection.search(
-        data=[query_embedding.tolist()],
-        anns_field="embedding",
-        param=search_params,
-        limit=5,
-        output_fields=["document_id"]
-    )
-
-    relevant_doc_ids = [hit.entity.get("document_id") for hit in search_results[0]]
-    documents = []
-    with driver.session() as session:
-        result = session.run("""
-            MATCH (d:Document)
-            WHERE d.doc_id IN $doc_ids
-            RETURN d.content AS content, d.metadata AS metadata
-        """, doc_ids=relevant_doc_ids)
-        for record in result:
-            metadata = json.loads(record['metadata'])
-            documents.append({
-                'content': record['content'],
-                'metadata': metadata,
-                'filename': metadata.get('filename', 'Unknown')
-            })
-    return documents
-
-# Slack signature verification
-async def verify_slack_signature(request: Request):
-    timestamp = request.headers.get("X-Slack-Request-Timestamp")
-    if abs(int(timestamp) - int(datetime.now().timestamp())) > 60 * 5:
-        return False
-
-    request_body = await request.body()  # Fetch raw body as bytes
-    sig_basestring = f"v0:{timestamp}:{request_body.decode('utf-8')}"
-    computed_signature = "v0=" + hmac.new(
-        SLACK_SIGNING_SECRET.encode(), sig_basestring.encode(), hashlib.sha256
-    ).hexdigest()
-
-    slack_signature = request.headers.get("X-Slack-Signature")
-    return hmac.compare_digest(computed_signature, slack_signature)
-
-async def process_slack_command(user_query: str, channel_id: str):
-    try:
-        # Process the query using your chat backend
-        response = generate_response(QueryRequest(query=user_query, new_chat=True), 1)
-
-        # Send the final response to Slack
-        slack_client.chat_postMessage(
-            channel=channel_id,
-            text=response.response
-        )
-    except Exception as e:
-        print(f"Error processing Slack command: {e}")
-        slack_client.chat_postMessage(
-            channel=channel_id,
-            text="Sorry, something went wrong while processing your request."
-        )
-
 
 def role_required(required_roles: list):
     def decorator(current_user=Depends(get_current_user_with_role)):
@@ -277,7 +207,7 @@ def get_relevant_docs_by_role_and_workspace(query, current_user):
     )
 
     relevant_doc_ids = [hit.entity.get("document_id") for hit in search_results[0]]
-    documents = []
+
     with driver.session() as session:
         if current_user["role"] == "superadmin":
             result = session.run("""
@@ -286,11 +216,20 @@ def get_relevant_docs_by_role_and_workspace(query, current_user):
                 RETURN d.content AS content, d.metadata AS metadata
             """, doc_ids=relevant_doc_ids)
         else:
-            result = session.run("""
-                MATCH (d:Document)
-                WHERE d.doc_id IN $doc_ids AND (d.global = TRUE OR d.workspace_id = $workspace_id)
-                RETURN d.content AS content, d.metadata AS metadata
-            """, doc_ids=relevant_doc_ids, workspace_id=current_user["workspace_id"])
+            if current_user["workspace_id"] is not None:
+                result = session.run("""
+                    MATCH (d:Document)
+                    WHERE d.doc_id IN $doc_ids AND (d.is_global = true OR d.workspace_id = $workspace_id)
+                    RETURN d.content AS content, d.metadata AS metadata
+                """, doc_ids=relevant_doc_ids, workspace_id=current_user["workspace_id"])
+            else:
+                result = session.run("""
+                    MATCH (d:Document)
+                    WHERE d.doc_id IN $doc_ids AND d.is_global = true
+                    RETURN d.content AS content, d.metadata AS metadata
+                """, doc_ids=relevant_doc_ids)
+
+        documents = []
         for record in result:
             metadata = json.loads(record['metadata'])
             documents.append({
@@ -300,10 +239,34 @@ def get_relevant_docs_by_role_and_workspace(query, current_user):
             })
     return documents
 
+async def verify_slack_signature(request: Request):
+    timestamp = request.headers.get("X-Slack-Request-Timestamp")
+    if abs(int(timestamp) - int(datetime.now().timestamp())) > 60 * 5:
+        return False
 
-###### ENDPOINTS ######
+    request_body = await request.body()
+    sig_basestring = f"v0:{timestamp}:{request_body.decode('utf-8')}"
+    computed_signature = "v0=" + hmac.new(
+        SLACK_SIGNING_SECRET.encode(), sig_basestring.encode(), hashlib.sha256
+    ).hexdigest()
 
-# Fetch all chats for a user
+    slack_signature = request.headers.get("X-Slack-Signature")
+    return hmac.compare_digest(computed_signature, slack_signature)
+
+async def process_slack_command(user_query: str, channel_id: str):
+    try:
+        # Provide a fallback user context if needed
+        response = generate_response(QueryRequest(query=user_query, new_chat=True), current_user={"user_id": 1, "role": "superadmin", "workspace_id": None})
+        slack_client.chat_postMessage(
+            channel=channel_id,
+            text=response.response
+        )
+    except Exception as e:
+        print(f"Error processing Slack command: {e}")
+        slack_client.chat_postMessage(
+            channel=channel_id,
+            text="Sorry, something went wrong while processing your request."
+        )
 
 @app.get("/chats", response_model=dict)
 def get_user_chats(current_user_id: int = Depends(get_current_user)):
@@ -324,8 +287,6 @@ def get_user_chats(current_user_id: int = Depends(get_current_user)):
         cursor.close()
         connection.close()
 
-
-# Fetch conversation history for a specific chat
 @app.get("/chat/history/{chat_id}", response_model=dict)
 def get_chat_history(chat_id: str, current_user_id: int = Depends(get_current_user)):
     connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
@@ -339,7 +300,6 @@ def get_chat_history(chat_id: str, current_user_id: int = Depends(get_current_us
         result = cursor.fetchall()
         history = []
         for record in result:
-            # Split by line, e.g., "User: ...\nAI: ..."
             conversations = record[0].split("\n")
             history.extend(conversations)
         return {"history": history}
@@ -347,10 +307,8 @@ def get_chat_history(chat_id: str, current_user_id: int = Depends(get_current_us
         cursor.close()
         connection.close()
 
-
-# Register a user
 @app.post("/register")
-def register_user(username: str = Form(), password: str = Form()):
+def register_user(username: str = Form(...), password: str = Form(...)):
     hashed_password = hashlib.sha256(password.encode()).hexdigest()
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
@@ -364,10 +322,8 @@ def register_user(username: str = Form(), password: str = Form()):
         cursor.close()
         connection.close()
 
-
-# Login
 @app.post("/login")
-def login_for_access_token(username: str = Form(), password: str = Form()):
+def login_for_access_token(username: str = Form(...), password: str = Form(...)):
     hashed_password = hashlib.sha256(password.encode()).hexdigest()
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
@@ -382,13 +338,12 @@ def login_for_access_token(username: str = Form(), password: str = Form()):
         cursor.close()
         connection.close()
 
-# Workspace creation (admin and superadmin only)
 @app.post("/workspaces")
-def create_workspace(name: str, current_user=Depends(role_required(["admin", "superadmin"]))):
+def create_workspace(request: CreateWorkspaceRequest, current_user=Depends(role_required(["admin", "superadmin"]))):
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
     try:
-        cursor.execute("INSERT INTO workspaces (name) VALUES (%s) RETURNING id", (name,))
+        cursor.execute("INSERT INTO workspaces (name) VALUES (%s) RETURNING id", (request.name,))
         workspace_id = cursor.fetchone()[0]
         connection.commit()
         return {"message": "Workspace created", "workspace_id": workspace_id}
@@ -396,22 +351,24 @@ def create_workspace(name: str, current_user=Depends(role_required(["admin", "su
         cursor.close()
         connection.close()
 
-# Assign user to workspace (admin and superadmin only)
 @app.post("/workspaces/{workspace_id}/assign-user")
-def assign_user_to_workspace(workspace_id: int, user_id: int, current_user=Depends(role_required(["admin", "superadmin"]))):
+def assign_user_to_workspace(workspace_id: int, request: AssignUserRequest, current_user=Depends(role_required(["admin", "superadmin"]))):
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
     try:
-        cursor.execute("UPDATE users SET workspace_id = %s WHERE id = %s", (workspace_id, user_id))
+        cursor.execute("UPDATE users SET workspace_id = %s WHERE id = %s", (workspace_id, request.user_id))
         connection.commit()
-        return {"message": f"User {user_id} assigned to workspace {workspace_id}"}
+        return {"message": f"User {request.user_id} assigned to workspace {workspace_id}"}
     finally:
         cursor.close()
         connection.close()
 
-# Upload document
 @app.post("/documents")
-def upload_document(file: UploadFile, scope: str = Form(), current_user=Depends(role_required(["user", "admin", "superadmin"]))):
+def upload_document(
+    file: UploadFile = File(...),
+    scope: str = Form(...),
+    current_user=Depends(role_required(["user", "admin", "superadmin"]))
+):
     if scope not in ["chat", "profile", "workspace", "system"]:
         raise HTTPException(status_code=400, detail="Invalid scope")
     if scope == "workspace" and current_user["role"] not in ["admin", "superadmin"]:
@@ -422,27 +379,37 @@ def upload_document(file: UploadFile, scope: str = Form(), current_user=Depends(
     file_content = file.file.read().decode("utf-8")
     doc_id = hashlib.sha256(file_content.encode()).hexdigest()
     metadata = {"filename": file.filename, "scope": scope}
-    with driver.session() as session:
-        session.run("CREATE (d:Document {doc_id: $doc_id, content: $content, metadata: $metadata})",
-                    doc_id=doc_id, content=file_content, metadata=json.dumps(metadata))
-    return {"message": f"Document uploaded successfully with scope {scope}"}
 
+    if scope in ["chat", "profile"]:
+        is_global = True
+        doc_workspace_id = None
+    elif scope == "workspace":
+        is_global = False
+        doc_workspace_id = current_user["workspace_id"]
+    else:  # system
+        is_global = False
+        doc_workspace_id = None
+
+    with driver.session() as session:
+        session.run("""
+            CREATE (d:Document {doc_id: $doc_id, content: $content, metadata: $metadata, is_global: $is_global, workspace_id: $doc_workspace_id})
+        """,
+        doc_id=doc_id, content=file_content, metadata=json.dumps(metadata), is_global=is_global, doc_workspace_id=doc_workspace_id)
+
+    return {"message": f"Document uploaded successfully with scope {scope}"}
 
 @app.post("/chat", response_model=ChatResponse)
 def generate_response(request: QueryRequest, current_user=Depends(get_current_user_with_role)):
-    # Log the incoming request data
     print(f"Request received: {request.dict()}")
 
-    # Validate or create chat_id
     if request.new_chat:
-        chat_id = str(uuid.uuid4())  # Generate new chat_id for a new chat
-        conversation = ""  # Start with an empty conversation
+        chat_id = str(uuid.uuid4())
+        conversation = ""
     else:
         chat_id = request.chat_id
         if not chat_id:
             raise HTTPException(status_code=400, detail="chat_id is required when new_chat is False")
 
-        # Fetch conversation history from the database
         connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
         cursor = connection.cursor()
         try:
@@ -451,19 +418,17 @@ def generate_response(request: QueryRequest, current_user=Depends(get_current_us
                 WHERE user_id = %s AND chat_id = %s ORDER BY id ASC
             """, (current_user["user_id"], chat_id))
             result = cursor.fetchall()
-            conversation = "\n".join([record[0] for record in result])  # Combine conversation history
+            conversation = "\n".join([record[0] for record in result])
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error fetching chat history: {e}")
         finally:
             cursor.close()
             connection.close()
 
-    # Retrieve relevant documents based on user role and workspace
     documents = get_relevant_docs_by_role_and_workspace(request.query, current_user)
     max_docs = 5
     documents = documents[:max_docs]
 
-    # Build the context for the LLM prompt
     context = ""
     for doc in documents:
         content = doc['content']
@@ -472,7 +437,6 @@ def generate_response(request: QueryRequest, current_user=Depends(get_current_us
         filename = filename.encode('utf-8', errors='replace').decode('utf-8')
         context += f"{content}\n(Source: {filename})\n\n"
 
-    # Construct the prompt for the LLM
     prompt = f"""
         You are a helpdesk assistant who assists users based on information from the provided documents.
 
@@ -490,25 +454,21 @@ def generate_response(request: QueryRequest, current_user=Depends(get_current_us
         Your kind and helpful Answer:
     """
 
-    # Generate the response from the LLM
-    with llm_lock:  # Ensure thread-safe access to the LLM
-        response = llm.invoke(prompt).strip()
-    response = response.encode('utf-8', errors='replace').decode('utf-8')
+    with llm_lock:
+        response_text = llm.invoke(prompt).strip()
+    response_text = response_text.encode('utf-8', errors='replace').decode('utf-8')
 
-    # Save the conversation to the database
-    save_conversation(current_user["user_id"], chat_id, request.query, response)
+    save_conversation(current_user["user_id"], chat_id, request.query, response_text)
 
-    # Prepare response sources
     source_names = ", ".join([doc['filename'] for doc in documents])
     source_names = source_names.encode('utf-8', errors='replace').decode('utf-8')
-    formatted_response = f"{response}\n\nSources:\n{source_names.replace(',', '\n')}"
+    formatted_response = f"{response_text}\n\nSources:\n{source_names.replace(',', '\n')}"
 
     return {"response": formatted_response, "sources": source_names, "chat_id": chat_id}
 
-
 @app.post("/slack/events")
 async def slack_events(request: Request):
-    if not await verify_slack_signature(request):  # Use await for the async function
+    if not await verify_slack_signature(request):
         return JSONResponse(status_code=403, content={"message": "Invalid signature"})
 
     body = await request.json()
@@ -517,12 +477,8 @@ async def slack_events(request: Request):
         user_query = event.get("text")
         channel_id = event.get("channel")
 
-        # Call your chat endpoint
         try:
-            # Here you should invoke your own chat logic, not Slack API
-            response = generate_response(QueryRequest(query=user_query, new_chat=True), 1)
-
-            # Send response back to Slack
+            response = generate_response(QueryRequest(query=user_query, new_chat=True), current_user={"user_id":1,"role":"superadmin","workspace_id":None})
             slack_client.chat_postMessage(
                 channel=channel_id,
                 text=response.response
@@ -531,7 +487,6 @@ async def slack_events(request: Request):
             print(f"Error sending message: {e.response['error']}")
 
     return JSONResponse(content={"message": "Event received"})
-
 
 @app.post("/slack/command")
 async def slack_command(request: Request, background_tasks: BackgroundTasks):
@@ -542,6 +497,22 @@ async def slack_command(request: Request, background_tasks: BackgroundTasks):
     user_query = form_data.get("text")
     channel_id = form_data.get("channel_id")
 
-    # Send an immediate response to Slack
     background_tasks.add_task(process_slack_command, user_query, channel_id)
     return JSONResponse(content={"response_type": "ephemeral", "text": "Processing your request..."})
+
+@app.post("/update-role")
+def update_role(request: UpdateRoleRequest, current_user=Depends(role_required(["admin","superadmin"]))):
+    if request.new_role not in ["user", "admin", "superadmin"]:
+        raise HTTPException(status_code=400, detail="Invalid role")
+
+    connection = psycopg2.connect(**DB_CONFIG)
+    cursor = connection.cursor()
+    try:
+        cursor.execute("UPDATE users SET role = %s WHERE username = %s RETURNING id", (request.new_role, request.username))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="User not found")
+        connection.commit()
+        return {"message": f"Role updated for user {request.username} to {request.new_role}"}
+    finally:
+        cursor.close()
+        connection.close()
