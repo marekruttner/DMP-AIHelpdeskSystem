@@ -8,7 +8,7 @@ from transformers import AutoTokenizer, AutoModel
 import torch
 import numpy as np
 from langchain_community.llms import Ollama
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, Form, Request  # Added Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.responses import JSONResponse
@@ -137,6 +137,30 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     except JWTError:
         raise credentials_exception
 
+async def get_current_user_with_role(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=401,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if not user_id:
+            raise credentials_exception
+
+        connection = psycopg2.connect(**DB_CONFIG)
+        cursor = connection.cursor()
+        cursor.execute("SELECT id, role, workspace_id FROM users WHERE id = %s", (user_id,))
+        result = cursor.fetchone()
+        cursor.close()
+        connection.close()
+
+        if not result:
+            raise credentials_exception
+        return {"user_id": result[0], "role": result[1], "workspace_id": result[2]}
+    except JWTError:
+        raise credentials_exception
 
 # Function to generate embeddings for a list of texts
 def generate_embeddings(texts, batch_size=32):
@@ -233,6 +257,50 @@ async def process_slack_command(user_query: str, channel_id: str):
             text="Sorry, something went wrong while processing your request."
         )
 
+
+def role_required(required_roles: list):
+    def decorator(current_user=Depends(get_current_user_with_role)):
+        if current_user["role"] not in required_roles:
+            raise HTTPException(status_code=403, detail="Not enough permissions")
+        return current_user
+    return decorator
+
+def get_relevant_docs_by_role_and_workspace(query, current_user):
+    query_embedding = generate_embeddings([query])[0]
+    search_params = {"metric_type": "COSINE", "params": {"ef": 128}}
+    search_results = collection.search(
+        data=[query_embedding.tolist()],
+        anns_field="embedding",
+        param=search_params,
+        limit=5,
+        output_fields=["document_id"]
+    )
+
+    relevant_doc_ids = [hit.entity.get("document_id") for hit in search_results[0]]
+    documents = []
+    with driver.session() as session:
+        if current_user["role"] == "superadmin":
+            result = session.run("""
+                MATCH (d:Document)
+                WHERE d.doc_id IN $doc_ids
+                RETURN d.content AS content, d.metadata AS metadata
+            """, doc_ids=relevant_doc_ids)
+        else:
+            result = session.run("""
+                MATCH (d:Document)
+                WHERE d.doc_id IN $doc_ids AND (d.global = TRUE OR d.workspace_id = $workspace_id)
+                RETURN d.content AS content, d.metadata AS metadata
+            """, doc_ids=relevant_doc_ids, workspace_id=current_user["workspace_id"])
+        for record in result:
+            metadata = json.loads(record['metadata'])
+            documents.append({
+                'content': record['content'],
+                'metadata': metadata,
+                'filename': metadata.get('filename', 'Unknown')
+            })
+    return documents
+
+
 ###### ENDPOINTS ######
 
 # Fetch all chats for a user
@@ -280,18 +348,14 @@ def get_chat_history(chat_id: str, current_user_id: int = Depends(get_current_us
         connection.close()
 
 
-# User registration endpoint
-@app.post("/register", response_model=RegistrationResponse)
-def register_user(credentials: UserCredentials):
-    connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
+# Register a user
+@app.post("/register")
+def register_user(username: str = Form(), password: str = Form()):
+    hashed_password = hashlib.sha256(password.encode()).hexdigest()
+    connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
-
-    hashed_password = hashlib.sha256(credentials.password.encode()).hexdigest()
     try:
-        cursor.execute("""
-            INSERT INTO users (username, password)
-            VALUES (%s, %s)
-        """, (credentials.username, hashed_password))
+        cursor.execute("INSERT INTO users (username, password) VALUES (%s, %s)", (username, hashed_password))
         connection.commit()
         return {"message": "Registration successful"}
     except psycopg2.errors.UniqueViolation:
@@ -301,62 +365,105 @@ def register_user(credentials: UserCredentials):
         connection.close()
 
 
-# User login endpoint
-@app.post("/login", response_model=LoginResponse)
-def login_for_access_token(credentials: UserCredentials):
-    connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
+# Login
+@app.post("/login")
+def login_for_access_token(username: str = Form(), password: str = Form()):
+    hashed_password = hashlib.sha256(password.encode()).hexdigest()
+    connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
     try:
-        cursor.execute("SELECT id, password FROM users WHERE username = %s", (credentials.username,))
+        cursor.execute("SELECT id FROM users WHERE username = %s AND password = %s", (username, hashed_password))
         result = cursor.fetchone()
         if result:
-            user_id, stored_hash = result
-            input_hash = hashlib.sha256(credentials.password.encode()).hexdigest()
-            if input_hash == stored_hash:
-                access_token = create_access_token(data={"sub": str(user_id)},
-                                                   expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-                return {"access_token": access_token, "message": "Login successful"}
+            access_token = create_access_token(data={"sub": str(result[0])})
+            return {"access_token": access_token, "message": "Login successful"}
         raise HTTPException(status_code=401, detail="Invalid username or password")
     finally:
         cursor.close()
         connection.close()
 
+# Workspace creation (admin and superadmin only)
+@app.post("/workspaces")
+def create_workspace(name: str, current_user=Depends(role_required(["admin", "superadmin"]))):
+    connection = psycopg2.connect(**DB_CONFIG)
+    cursor = connection.cursor()
+    try:
+        cursor.execute("INSERT INTO workspaces (name) VALUES (%s) RETURNING id", (name,))
+        workspace_id = cursor.fetchone()[0]
+        connection.commit()
+        return {"message": "Workspace created", "workspace_id": workspace_id}
+    finally:
+        cursor.close()
+        connection.close()
 
-# Chat endpoint
+# Assign user to workspace (admin and superadmin only)
+@app.post("/workspaces/{workspace_id}/assign-user")
+def assign_user_to_workspace(workspace_id: int, user_id: int, current_user=Depends(role_required(["admin", "superadmin"]))):
+    connection = psycopg2.connect(**DB_CONFIG)
+    cursor = connection.cursor()
+    try:
+        cursor.execute("UPDATE users SET workspace_id = %s WHERE id = %s", (workspace_id, user_id))
+        connection.commit()
+        return {"message": f"User {user_id} assigned to workspace {workspace_id}"}
+    finally:
+        cursor.close()
+        connection.close()
+
+# Upload document
+@app.post("/documents")
+def upload_document(file: UploadFile, scope: str = Form(), current_user=Depends(role_required(["user", "admin", "superadmin"]))):
+    if scope not in ["chat", "profile", "workspace", "system"]:
+        raise HTTPException(status_code=400, detail="Invalid scope")
+    if scope == "workspace" and current_user["role"] not in ["admin", "superadmin"]:
+        raise HTTPException(status_code=403, detail="Admins and Superadmins only")
+    if scope == "system" and current_user["role"] != "superadmin":
+        raise HTTPException(status_code=403, detail="Superadmins only")
+
+    file_content = file.file.read().decode("utf-8")
+    doc_id = hashlib.sha256(file_content.encode()).hexdigest()
+    metadata = {"filename": file.filename, "scope": scope}
+    with driver.session() as session:
+        session.run("CREATE (d:Document {doc_id: $doc_id, content: $content, metadata: $metadata})",
+                    doc_id=doc_id, content=file_content, metadata=json.dumps(metadata))
+    return {"message": f"Document uploaded successfully with scope {scope}"}
+
+
 @app.post("/chat", response_model=ChatResponse)
-def generate_response(request: QueryRequest, current_user_id: int = Depends(get_current_user)):
+def generate_response(request: QueryRequest, current_user=Depends(get_current_user_with_role)):
     # Log the incoming request data
     print(f"Request received: {request.dict()}")
 
+    # Validate or create chat_id
     if request.new_chat:
-        # Create a new chat_id for a new conversation
-        chat_id = str(uuid.uuid4())
-        conversation = ""  # Start fresh for a new chat
+        chat_id = str(uuid.uuid4())  # Generate new chat_id for a new chat
+        conversation = ""  # Start with an empty conversation
     else:
-        # Validate chat_id is provided when not starting a new chat
         chat_id = request.chat_id
         if not chat_id:
             raise HTTPException(status_code=400, detail="chat_id is required when new_chat is False")
 
-        # Fetch conversation history for the chat
+        # Fetch conversation history from the database
         connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
         cursor = connection.cursor()
         try:
             cursor.execute("""
-                SELECT conversation FROM user_conversations WHERE user_id = %s AND chat_id = %s ORDER BY id ASC
-            """, (current_user_id, chat_id))
+                SELECT conversation FROM user_conversations 
+                WHERE user_id = %s AND chat_id = %s ORDER BY id ASC
+            """, (current_user["user_id"], chat_id))
             result = cursor.fetchall()
-            conversation = "\n".join([record[0] for record in result])
+            conversation = "\n".join([record[0] for record in result])  # Combine conversation history
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error fetching chat history: {e}")
         finally:
             cursor.close()
             connection.close()
 
-    documents = get_relevant_docs(request.query)
+    # Retrieve relevant documents based on user role and workspace
+    documents = get_relevant_docs_by_role_and_workspace(request.query, current_user)
     max_docs = 5
     documents = documents[:max_docs]
 
+    # Build the context for the LLM prompt
     context = ""
     for doc in documents:
         content = doc['content']
@@ -365,6 +472,7 @@ def generate_response(request: QueryRequest, current_user_id: int = Depends(get_
         filename = filename.encode('utf-8', errors='replace').decode('utf-8')
         context += f"{content}\n(Source: {filename})\n\n"
 
+    # Construct the prompt for the LLM
     prompt = f"""
         You are a helpdesk assistant who assists users based on information from the provided documents.
 
@@ -382,12 +490,15 @@ def generate_response(request: QueryRequest, current_user_id: int = Depends(get_
         Your kind and helpful Answer:
     """
 
+    # Generate the response from the LLM
     with llm_lock:  # Ensure thread-safe access to the LLM
         response = llm.invoke(prompt).strip()
     response = response.encode('utf-8', errors='replace').decode('utf-8')
 
-    save_conversation(current_user_id, chat_id, request.query, response)
+    # Save the conversation to the database
+    save_conversation(current_user["user_id"], chat_id, request.query, response)
 
+    # Prepare response sources
     source_names = ", ".join([doc['filename'] for doc in documents])
     source_names = source_names.encode('utf-8', errors='replace').decode('utf-8')
     formatted_response = f"{response}\n\nSources:\n{source_names.replace(',', '\n')}"

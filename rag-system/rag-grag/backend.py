@@ -234,7 +234,7 @@ def process_documents(directory):
         spinner.succeed("Explicit document links stored successfully.")
 
 if __name__ == "__main__":
-    directory = "/home/marek/rag-documents/"
+    directory = "/home/marek/rag-documents/global/"
     if os.path.isdir(directory):
         with Halo(text="Starting document processing...", spinner="dots") as spinner:
             try:

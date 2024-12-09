@@ -1,5 +1,6 @@
 # DMP-AIHelpdeskSystem
-Base of the RAG-GrahpRAG system created as part of the DMP @ SPSE Plzen. 
+Base of the RAG-GrahpRAG system created as part of the DMP @ SPSE Plzen, which is included in the `./documentation/` directory.
+
 
 ## Repository structure
 ```plaintext
@@ -39,6 +40,9 @@ Base of the RAG-GrahpRAG system created as part of the DMP @ SPSE Plzen.
 ### RAG-GRAG Backend
 1. Use `docker-compose up` in `rag-system/rag-grag/` directory
 2. Install python dependecies using `pip install -r requirements.txt`in `rag-system/rag-grag/` directory
+3. Adjust directory path in file `rag-system/rag-grag/backend.py` to your folder with markdown ans PDF files
+4. Run backend.py with command `python backend.py` to store data into databases
+5. Use command `uvicorn frontend:app` to start server
 
 ---
 By [Marek Ruttner](https://www.linkedin.com/in/marek-ruttner/) 2024
