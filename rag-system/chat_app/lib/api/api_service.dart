@@ -21,7 +21,6 @@ class ApiService {
 
   String? get currentUserRole => _role;
 
-  /// Clears the stored token and role, effectively logging the user out.
   void logout() {
     _token = null;
     _role = null;
@@ -35,13 +34,10 @@ class ApiService {
     return headers;
   }
 
-  /// Logs the user in by sending form data (username, password) to /login
   Future<void> login(String username, String password) async {
     final response = await http.post(
       Uri.parse('$baseUrl/login'),
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded'
-      },
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
       body: 'username=${Uri.encodeQueryComponent(username)}&password=${Uri.encodeQueryComponent(password)}',
     );
 
@@ -57,13 +53,10 @@ class ApiService {
     }
   }
 
-  /// Registers a new user by sending form data to /register
   Future<void> register(String username, String password) async {
     final response = await http.post(
       Uri.parse('$baseUrl/register'),
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded'
-      },
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
       body: 'username=${Uri.encodeQueryComponent(username)}&password=${Uri.encodeQueryComponent(password)}',
     );
 
@@ -75,7 +68,6 @@ class ApiService {
     }
   }
 
-  /// Fetches a list of chats available to the user
   Future<List<dynamic>> getChats() async {
     final response = await http.get(Uri.parse('$baseUrl/chats'), headers: authHeaders);
     if (response.statusCode == 200) {
@@ -86,7 +78,6 @@ class ApiService {
     }
   }
 
-  /// Fetches the chat history for a given chat_id
   Future<Map<String, dynamic>> getChatHistory(String chatId) async {
     final response = await http.get(Uri.parse('$baseUrl/chat/history/$chatId'), headers: authHeaders);
     if (response.statusCode == 200) {
@@ -96,7 +87,6 @@ class ApiService {
     }
   }
 
-  /// Sends a message to the chat endpoint, creating a new chat if newChat = true
   Future<Map<String, dynamic>> chat(String query, {required bool newChat, String? chatId}) async {
     final body = {'query': query, 'new_chat': newChat};
     if (chatId != null) body['chat_id'] = chatId;
@@ -117,27 +107,61 @@ class ApiService {
     }
   }
 
-  /// ADMIN & DOCUMENT METHODS EXAMPLES:
+  // Admin & Documents
 
-  /// Update a user's role (superadmin or admin only)
-  Future<void> updateRole(String username, String newRole) async {
-    final payload = {"username": username, "new_role": newRole};
-    final response = await http.post(
-      Uri.parse('$baseUrl/update-role'),
-      headers: {
-        ...authHeaders,
-        'Content-Type': 'application/json'
-      },
-      body: json.encode(payload),
-    );
-
-    if (response.statusCode != 200) {
-      final errorData = json.decode(utf8.decode(response.bodyBytes));
-      throw Exception(errorData['detail'] ?? 'Failed to update role');
+  Future<List<dynamic>> getAllUsers() async {
+    final response = await http.get(Uri.parse('$baseUrl/admin/users'), headers: authHeaders);
+    if (response.statusCode == 200) {
+      final data = json.decode(utf8.decode(response.bodyBytes));
+      return data['users'] ?? [];
+    } else {
+      throw Exception('Failed to load users');
     }
   }
 
-  /// Create a new workspace (admin or superadmin only)
+  Future<void> changeUsername(int userId, String newUsername) async {
+    final uri = Uri.parse('$baseUrl/admin/users/$userId/change-username');
+    final response = await http.post(
+      uri,
+      headers: {
+        ...authHeaders,
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: 'new_username=${Uri.encodeQueryComponent(newUsername)}',
+    );
+    if (response.statusCode != 200) {
+      final errorData = json.decode(utf8.decode(response.bodyBytes));
+      throw Exception(errorData['detail'] ?? 'Failed to change username');
+    }
+  }
+
+  Future<void> changePassword(int userId, String newPassword) async {
+    final uri = Uri.parse('$baseUrl/admin/users/$userId/change-password');
+    final response = await http.post(
+      uri,
+      headers: {
+        ...authHeaders,
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: 'new_password=${Uri.encodeQueryComponent(newPassword)}',
+    );
+    if (response.statusCode != 200) {
+      final errorData = json.decode(utf8.decode(response.bodyBytes));
+      throw Exception(errorData['detail'] ?? 'Failed to change password');
+    }
+  }
+
+  Future<List<dynamic>> getUserChats(int userId) async {
+    final uri = Uri.parse('$baseUrl/admin/users/$userId/chats');
+    final response = await http.get(uri, headers: authHeaders);
+    if (response.statusCode == 200) {
+      final data = json.decode(utf8.decode(response.bodyBytes));
+      return data['chats'] ?? [];
+    } else {
+      throw Exception('Failed to load user chats');
+    }
+  }
+
   Future<Map<String, dynamic>> createWorkspace(String name) async {
     final payload = {"name": name};
     final response = await http.post(
@@ -157,7 +181,6 @@ class ApiService {
     }
   }
 
-  /// Assign a user to a workspace (admin or superadmin only)
   Future<Map<String, dynamic>> assignUserToWorkspace(int workspaceId, int userId) async {
     final payload = {"user_id": userId};
     final response = await http.post(
@@ -177,8 +200,23 @@ class ApiService {
     }
   }
 
-  /// Upload a document (user, admin, or superadmin)
-  /// scope can be: chat, profile, workspace, system
+  Future<void> updateRole(String username, String newRole) async {
+    final payload = {"username": username, "new_role": newRole};
+    final response = await http.post(
+      Uri.parse('$baseUrl/update-role'),
+      headers: {
+        ...authHeaders,
+        'Content-Type': 'application/json'
+      },
+      body: json.encode(payload),
+    );
+
+    if (response.statusCode != 200) {
+      final errorData = json.decode(utf8.decode(response.bodyBytes));
+      throw Exception(errorData['detail'] ?? 'Failed to update role');
+    }
+  }
+
   Future<Map<String, dynamic>> uploadDocument(String filePath, String scope) async {
     var request = http.MultipartRequest('POST', Uri.parse('$baseUrl/documents'));
     request.headers.addAll(authHeaders);

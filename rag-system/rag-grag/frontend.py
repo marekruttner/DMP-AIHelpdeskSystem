@@ -517,3 +517,69 @@ def update_role(request: UpdateRoleRequest, current_user=Depends(role_required([
     finally:
         cursor.close()
         connection.close()
+
+# Example: GET /admin/users (superadmin only)
+@app.get("/admin/users")
+def get_all_users(current_user=Depends(role_required(["superadmin"]))):
+    connection = psycopg2.connect(**DB_CONFIG)
+    cursor = connection.cursor()
+    try:
+        cursor.execute("SELECT id, username, role FROM users ORDER BY id ASC")
+        result = cursor.fetchall()
+        users = []
+        for row in result:
+            users.append({"id": row[0], "username": row[1], "role": row[2]})
+        return {"users": users}
+    finally:
+        cursor.close()
+        connection.close()
+
+
+@app.post("/admin/users/{user_id}/change-username")
+def change_username(user_id: int, new_username: str = Form(...), current_user=Depends(role_required(["superadmin"]))):
+    connection = psycopg2.connect(**DB_CONFIG)
+    cursor = connection.cursor()
+    try:
+        cursor.execute("UPDATE users SET username = %s WHERE id = %s RETURNING id", (new_username, user_id))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="User not found")
+        connection.commit()
+        return {"message": "Username updated successfully"}
+    finally:
+        cursor.close()
+        connection.close()
+
+@app.post("/admin/users/{user_id}/change-password")
+def change_password(user_id: int, new_password: str = Form(...), current_user=Depends(role_required(["superadmin"]))):
+    hashed_password = hashlib.sha256(new_password.encode()).hexdigest()
+    connection = psycopg2.connect(**DB_CONFIG)
+    cursor = connection.cursor()
+    try:
+        cursor.execute("UPDATE users SET password = %s WHERE id = %s RETURNING id", (hashed_password, user_id))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="User not found")
+        connection.commit()
+        return {"message": "Password updated successfully"}
+    finally:
+        cursor.close()
+        connection.close()
+
+
+@app.get("/admin/users/{user_id}/chats")
+def get_user_chats(user_id: int, current_user=Depends(role_required(["superadmin"]))):
+    connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
+    cursor = connection.cursor()
+    try:
+        cursor.execute("""
+            SELECT chat_id, MAX(conversation) AS latest_message
+            FROM user_conversations
+            WHERE user_id = %s
+            GROUP BY chat_id
+            ORDER BY MAX(id) DESC
+        """, (user_id,))
+        result = cursor.fetchall()
+        chats = [{"chat_id": row[0], "latest_message": row[1]} for row in result]
+        return {"chats": chats}
+    finally:
+        cursor.close()
+        connection.close()
