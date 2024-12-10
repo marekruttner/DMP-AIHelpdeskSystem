@@ -7,19 +7,25 @@ class ApiService {
   factory ApiService() => _instance;
   ApiService._internal();
 
-  final String baseUrl = 'http://localhost:8000'; // Update with your server URL
+  final String baseUrl = 'http://localhost:8000';
   String? _token;
-  String? _role; // Store user role if needed
+  String? _role;
 
   void setToken(String token) {
-    _token = token;
+    _token = token.isEmpty ? null : token;
   }
 
   void setRole(String role) {
-    _role = role;
+    _role = role.isEmpty ? null : role;
   }
 
   String? get currentUserRole => _role;
+
+  /// Clears the stored token and role, effectively logging the user out.
+  void logout() {
+    _token = null;
+    _role = null;
+  }
 
   Map<String, String> get authHeaders {
     final headers = <String, String>{};
@@ -29,7 +35,7 @@ class ApiService {
     return headers;
   }
 
-  /// LOGIN using form data (POST /login)
+  /// Logs the user in by sending form data (username, password) to /login
   Future<void> login(String username, String password) async {
     final response = await http.post(
       Uri.parse('$baseUrl/login'),
@@ -42,15 +48,16 @@ class ApiService {
     if (response.statusCode == 200) {
       final data = json.decode(utf8.decode(response.bodyBytes));
       setToken(data['access_token']);
-      // If your backend returns user role on login, set it here:
-      // setRole(data['role']);
+      if (data.containsKey('role')) {
+        setRole(data['role']);
+      }
     } else {
       final errorData = json.decode(utf8.decode(response.bodyBytes));
       throw Exception(errorData['detail'] ?? 'Failed to login');
     }
   }
 
-  /// REGISTER using form data (POST /register)
+  /// Registers a new user by sending form data to /register
   Future<void> register(String username, String password) async {
     final response = await http.post(
       Uri.parse('$baseUrl/register'),
@@ -68,7 +75,7 @@ class ApiService {
     }
   }
 
-  /// GET CHATS (GET /chats)
+  /// Fetches a list of chats available to the user
   Future<List<dynamic>> getChats() async {
     final response = await http.get(Uri.parse('$baseUrl/chats'), headers: authHeaders);
     if (response.statusCode == 200) {
@@ -79,7 +86,7 @@ class ApiService {
     }
   }
 
-  /// GET CHAT HISTORY (GET /chat/history/{chat_id})
+  /// Fetches the chat history for a given chat_id
   Future<Map<String, dynamic>> getChatHistory(String chatId) async {
     final response = await http.get(Uri.parse('$baseUrl/chat/history/$chatId'), headers: authHeaders);
     if (response.statusCode == 200) {
@@ -89,7 +96,7 @@ class ApiService {
     }
   }
 
-  /// CHAT (POST /chat) - Sends a query to the assistant
+  /// Sends a message to the chat endpoint, creating a new chat if newChat = true
   Future<Map<String, dynamic>> chat(String query, {required bool newChat, String? chatId}) async {
     final body = {'query': query, 'new_chat': newChat};
     if (chatId != null) body['chat_id'] = chatId;
@@ -110,7 +117,9 @@ class ApiService {
     }
   }
 
-  /// UPDATE ROLE (POST /update-role) - JSON-based
+  /// ADMIN & DOCUMENT METHODS EXAMPLES:
+
+  /// Update a user's role (superadmin or admin only)
   Future<void> updateRole(String username, String newRole) async {
     final payload = {"username": username, "new_role": newRole};
     final response = await http.post(
@@ -128,7 +137,7 @@ class ApiService {
     }
   }
 
-  /// CREATE WORKSPACE (POST /workspaces) - JSON-based
+  /// Create a new workspace (admin or superadmin only)
   Future<Map<String, dynamic>> createWorkspace(String name) async {
     final payload = {"name": name};
     final response = await http.post(
@@ -148,7 +157,7 @@ class ApiService {
     }
   }
 
-  /// ASSIGN USER TO WORKSPACE (POST /workspaces/{workspace_id}/assign-user) - JSON-based
+  /// Assign a user to a workspace (admin or superadmin only)
   Future<Map<String, dynamic>> assignUserToWorkspace(int workspaceId, int userId) async {
     final payload = {"user_id": userId};
     final response = await http.post(
@@ -168,7 +177,8 @@ class ApiService {
     }
   }
 
-  /// UPLOAD DOCUMENT (POST /documents) - multipart/form-data
+  /// Upload a document (user, admin, or superadmin)
+  /// scope can be: chat, profile, workspace, system
   Future<Map<String, dynamic>> uploadDocument(String filePath, String scope) async {
     var request = http.MultipartRequest('POST', Uri.parse('$baseUrl/documents'));
     request.headers.addAll(authHeaders);

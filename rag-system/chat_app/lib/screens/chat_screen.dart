@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:chat_app/api/api_service.dart';
+import 'package:chat_app/widgets/common_app_bar.dart'; // Import the common app bar
 
 class ChatScreen extends StatefulWidget {
   @override
@@ -11,7 +12,7 @@ class _ChatScreenState extends State<ChatScreen> {
   final TextEditingController messageController = TextEditingController();
   final List<Map<String, dynamic>> messages = [];
   final ApiService apiService = ApiService();
-  final ScrollController _scrollController = ScrollController(); // Scroll controller for chat
+  final ScrollController _scrollController = ScrollController();
   List<Map<String, dynamic>> chats = [];
   String? currentChatId;
   String? currentChatName;
@@ -26,13 +27,11 @@ class _ChatScreenState extends State<ChatScreen> {
     try {
       final chatList = await apiService.getChats();
       setState(() {
-        chats = chatList
-            .map<Map<String, dynamic>>((chat) => {
+        chats = chatList.map<Map<String, dynamic>>((chat) => {
           "chatId": chat['chat_id'],
           "name": "Chat ${chat['chat_id'].substring(0, 6)}",
           "latestMessage": chat['latest_message'] ?? "No messages yet"
-        })
-            .toList();
+        }).toList();
       });
     } catch (e) {
       setState(() {
@@ -151,22 +150,8 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: Text(
-          currentChatName ?? "Select a Chat",
-          style: TextStyle(color: Colors.pink, fontSize: 20),
-        ),
-        backgroundColor: Colors.white,
-        elevation: 0,
-        actions: [
-          IconButton(
-            icon: Icon(Icons.add, color: Colors.blue),
-            onPressed: () {
-              startNewChat();
-            },
-          ),
-        ],
-      ),
+      // Use CommonAppBar here with a title and the current ApiService
+      appBar: CommonAppBar(apiService: apiService, title: currentChatName ?? "Select a Chat"),
       drawer: Drawer(
         child: ListView(
           padding: EdgeInsets.zero,
@@ -262,19 +247,18 @@ class ChatBubble extends StatelessWidget {
         ),
         child: isUser
             ? Text(
-          message, // Plain text for user messages
+          message,
           style: TextStyle(fontSize: 16, height: 1.5),
           textDirection: TextDirection.ltr,
         )
             : MarkdownBody(
-          data: message, // Render AI responses as Markdown
+          data: message,
           styleSheet: MarkdownStyleSheet(
             p: TextStyle(fontSize: 16, height: 1.5),
             listBullet: TextStyle(fontSize: 16, height: 1.5),
           ),
           onTapLink: (text, href, title) {
             if (href != null) {
-              // Handle link taps (e.g., open in a browser)
               print("Tapped link: $href");
             }
           },
@@ -283,4 +267,3 @@ class ChatBubble extends StatelessWidget {
     );
   }
 }
-

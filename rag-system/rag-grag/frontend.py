@@ -328,11 +328,12 @@ def login_for_access_token(username: str = Form(...), password: str = Form(...))
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
     try:
-        cursor.execute("SELECT id FROM users WHERE username = %s AND password = %s", (username, hashed_password))
+        cursor.execute("SELECT id, role FROM users WHERE username = %s AND password = %s", (username, hashed_password))
         result = cursor.fetchone()
         if result:
-            access_token = create_access_token(data={"sub": str(result[0])})
-            return {"access_token": access_token, "message": "Login successful"}
+            user_id, user_role = result
+            access_token = create_access_token(data={"sub": str(user_id)})
+            return {"access_token": access_token, "message": "Login successful", "role": user_role}
         raise HTTPException(status_code=401, detail="Invalid username or password")
     finally:
         cursor.close()

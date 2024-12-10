@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:chat_app/api/api_service.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:chat_app/widgets/common_app_bar.dart'; // Import the CommonAppBar
 
 class AdminScreen extends StatefulWidget {
   @override
@@ -94,7 +95,7 @@ class _AdminScreenState extends State<AdminScreen> {
     if (role != "admin" && role != "superadmin") {
       // Not authorized
       return Scaffold(
-        appBar: AppBar(title: Text("Admin Settings"), backgroundColor: Colors.pink),
+        appBar: CommonAppBar(apiService: apiService, title: "Admin Settings"),
         body: Center(
           child: Text("You do not have permission to view this page."),
         ),
@@ -102,7 +103,7 @@ class _AdminScreenState extends State<AdminScreen> {
     }
 
     return Scaffold(
-      appBar: AppBar(title: Text("Admin Settings"), backgroundColor: Colors.pink),
+      appBar: CommonAppBar(apiService: apiService, title: "Admin Settings"),
       body: SingleChildScrollView(
         padding: EdgeInsets.all(16),
         child: Column(

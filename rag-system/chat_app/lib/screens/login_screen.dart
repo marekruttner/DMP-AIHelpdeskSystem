@@ -14,10 +14,7 @@ class LoginScreen extends StatelessWidget {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Text(
-              "Login",
-              style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Colors.pink),
-            ),
+            Text("Login", style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Colors.pink)),
             SizedBox(height: 20),
             TextField(
               controller: usernameController,
@@ -29,23 +26,22 @@ class LoginScreen extends StatelessWidget {
             SizedBox(height: 10),
             TextField(
               controller: passwordController,
+              obscureText: true,
               decoration: InputDecoration(
                 labelText: "Password",
                 border: OutlineInputBorder(borderRadius: BorderRadius.circular(20)),
               ),
-              obscureText: true,
             ),
             SizedBox(height: 20),
             ElevatedButton(
               onPressed: () async {
                 try {
-                  await apiService.login(
-                    usernameController.text,
-                    passwordController.text,
-                  );
+                  await apiService.login(usernameController.text, passwordController.text);
+                  // If login success:
                   Navigator.pushReplacementNamed(context, '/chat');
                 } catch (e) {
                   print("Login failed: $e");
+                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Login failed')));
                 }
               },
               style: ElevatedButton.styleFrom(

@@ -14,10 +14,7 @@ class SignupScreen extends StatelessWidget {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Text(
-              "Sign Up",
-              style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Colors.pink),
-            ),
+            Text("Sign Up", style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Colors.pink)),
             SizedBox(height: 20),
             TextField(
               controller: usernameController,
@@ -29,23 +26,21 @@ class SignupScreen extends StatelessWidget {
             SizedBox(height: 10),
             TextField(
               controller: passwordController,
+              obscureText: true,
               decoration: InputDecoration(
                 labelText: "Password",
                 border: OutlineInputBorder(borderRadius: BorderRadius.circular(20)),
               ),
-              obscureText: true,
             ),
             SizedBox(height: 20),
             ElevatedButton(
               onPressed: () async {
                 try {
-                  final response = await apiService.register(
-                    usernameController.text,
-                    passwordController.text,
-                  );
+                  await apiService.register(usernameController.text, passwordController.text);
                   Navigator.pushReplacementNamed(context, '/login');
                 } catch (e) {
-                  print(e);
+                  print("Sign up failed: $e");
+                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Sign up failed')));
                 }
               },
               style: ElevatedButton.styleFrom(
