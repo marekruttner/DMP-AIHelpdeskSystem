@@ -2,9 +2,6 @@ import os
 import hashlib
 import json
 import psycopg2
-from pymilvus import Collection, connections
-from neo4j import GraphDatabase
-from transformers import AutoTokenizer, AutoModel
 import torch
 import numpy as np
 from langchain_community.llms import Ollama
@@ -22,6 +19,9 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 import hmac
 import threading
+
+# Import the backend module
+import backend
 
 # FastAPI app initialization
 app = FastAPI()
@@ -43,31 +43,6 @@ DB_CONFIG = {
     "port": os.getenv("DB_PORT"),
 }
 
-# Connect to Milvus
-MILVUS_HOST = os.getenv("MILVUS_HOST")
-MILVUS_PORT = os.getenv("MILVUS_PORT")
-connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
-collection = Collection("document_embeddings")
-collection.load()
-
-# Connect to Neo4j
-NEO4J_URI = os.getenv("NEO4J_URI")
-NEO4J_USER = os.getenv("NEO4J_USER")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
-driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-
-# Initialize Hugging Face model
-model_name = "Seznam/retromae-small-cs"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModel.from_pretrained(model_name)
-
-# Initialize LLM
-llm = Ollama(model="llama3.1:8b")
-
-# Create locks for thread safety
-model_lock = threading.Lock()
-llm_lock = threading.Lock()
-
 # JWT Configuration
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
@@ -80,6 +55,28 @@ SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
+
+model_lock = threading.Lock()
+llm_lock = threading.Lock()
+
+# Initialize backend (Milvus, Neo4j, Model)
+# Using default or environment vars
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "testtest")
+MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
+MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
+
+backend.initialize_all(
+    neo4j_uri=NEO4J_URI,
+    neo4j_user=NEO4J_USER,
+    neo4j_password=NEO4J_PASSWORD,
+    milvus_host=MILVUS_HOST,
+    milvus_port=MILVUS_PORT
+)
+
+# Initialize LLM
+llm = Ollama(model="llama3.1:8b")
 
 class UserCredentials(BaseModel):
     username: str
@@ -164,9 +161,9 @@ def generate_embeddings(texts, batch_size=32):
     for i in range(0, len(texts), batch_size):
         batch_texts = texts[i:i + batch_size]
         with model_lock:
-            inputs = tokenizer(batch_texts, padding=True, truncation=True, return_tensors='pt', max_length=128)
+            inputs = backend.tokenizer(batch_texts, padding=True, truncation=True, return_tensors='pt', max_length=128)
             with torch.no_grad():
-                outputs = model(**inputs)
+                outputs = backend.model(**inputs)
                 embeddings = outputs.last_hidden_state[:, 0, :].numpy()
         all_embeddings.extend(embeddings)
     return np.array(all_embeddings)
@@ -196,9 +193,11 @@ def role_required(required_roles: list):
     return decorator
 
 def get_relevant_docs_by_role_and_workspace(query, current_user):
+    # This function uses embeddings for the query but does not store any data,
+    # so it can remain here. We just refer to backend.collection and backend.driver.
     query_embedding = generate_embeddings([query])[0]
     search_params = {"metric_type": "COSINE", "params": {"ef": 128}}
-    search_results = collection.search(
+    search_results = backend.collection.search(
         data=[query_embedding.tolist()],
         anns_field="embedding",
         param=search_params,
@@ -208,7 +207,7 @@ def get_relevant_docs_by_role_and_workspace(query, current_user):
 
     relevant_doc_ids = [hit.entity.get("document_id") for hit in search_results[0]]
 
-    with driver.session() as session:
+    with backend.driver.session() as session:
         if current_user["role"] == "superadmin":
             result = session.run("""
                 MATCH (d:Document)
@@ -391,7 +390,7 @@ def upload_document(
         is_global = False
         doc_workspace_id = None
 
-    with driver.session() as session:
+    with backend.driver.session() as session:
         session.run("""
             CREATE (d:Document {doc_id: $doc_id, content: $content, metadata: $metadata, is_global: $is_global, workspace_id: $doc_workspace_id})
         """,
@@ -518,7 +517,6 @@ def update_role(request: UpdateRoleRequest, current_user=Depends(role_required([
         cursor.close()
         connection.close()
 
-# Example: GET /admin/users (superadmin only)
 @app.get("/admin/users")
 def get_all_users(current_user=Depends(role_required(["superadmin"]))):
     connection = psycopg2.connect(**DB_CONFIG)
@@ -533,7 +531,6 @@ def get_all_users(current_user=Depends(role_required(["superadmin"]))):
     finally:
         cursor.close()
         connection.close()
-
 
 @app.post("/admin/users/{user_id}/change-username")
 def change_username(user_id: int, new_username: str = Form(...), current_user=Depends(role_required(["superadmin"]))):
@@ -564,7 +561,6 @@ def change_password(user_id: int, new_password: str = Form(...), current_user=De
         cursor.close()
         connection.close()
 
-
 @app.get("/admin/users/{user_id}/chats")
 def get_user_chats(user_id: int, current_user=Depends(role_required(["superadmin"]))):
     connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
@@ -583,3 +579,15 @@ def get_user_chats(user_id: int, current_user=Depends(role_required(["superadmin
     finally:
         cursor.close()
         connection.close()
+
+# New endpoint to trigger the embedding of documents from a given directory
+@app.post("/embed-documents")
+def embed_documents(directory: str = Form(...), current_user=Depends(role_required(["admin", "superadmin"]))):
+    if not os.path.isdir(directory):
+        raise HTTPException(status_code=400, detail="Invalid directory")
+
+    try:
+        backend.process_documents(directory)
+        return {"message": f"Documents in {directory} processed and embedded successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

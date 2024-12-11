@@ -22,6 +22,9 @@ class _AdminScreenState extends State<AdminScreen> {
 
   String statusMessage = "";
 
+  // New controller for the embed documents directory
+  final TextEditingController embedDirectoryController = TextEditingController();
+
   // User management variables
   List<dynamic> allUsers = [];
   Map<int, List<dynamic>> userChatsMap = {}; // cache user chats
@@ -278,6 +281,54 @@ class _AdminScreenState extends State<AdminScreen> {
                         onPressed: updateUserRole,
                         style: ElevatedButton.styleFrom(backgroundColor: Colors.pink),
                         child: Text("Update Role"),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+
+            SizedBox(height: 20),
+
+// Show Embed Documents card only if user is superadmin
+            if (role == "superadmin")
+              Card(
+                child: Padding(
+                  padding: EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text("Embed Documents", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                      SizedBox(height: 10),
+                      TextField(
+                        controller: embedDirectoryController,
+                        decoration: InputDecoration(
+                          labelText: "Directory Path",
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      SizedBox(height: 10),
+                      ElevatedButton(
+                        onPressed: () async {
+                          final directory = embedDirectoryController.text.trim();
+                          if (directory.isEmpty) {
+                            setState(() {
+                              statusMessage = "Directory path cannot be empty.";
+                            });
+                            return;
+                          }
+                          try {
+                            await apiService.embedDocuments(directory);
+                            setState(() {
+                              statusMessage = "Documents embedded successfully from $directory.";
+                            });
+                          } catch (e) {
+                            setState(() {
+                              statusMessage = "Error embedding documents: $e";
+                            });
+                          }
+                        },
+                        style: ElevatedButton.styleFrom(backgroundColor: Colors.pink),
+                        child: Text("Start Embedding"),
                       ),
                     ],
                   ),

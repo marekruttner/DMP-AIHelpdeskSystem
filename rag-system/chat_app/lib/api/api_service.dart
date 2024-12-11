@@ -233,4 +233,20 @@ class ApiService {
       throw Exception(errorData['detail'] ?? 'Failed to upload document');
     }
   }
+
+  Future<void> embedDocuments(String directory) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/embed-documents'),
+      headers: {
+        ...authHeaders,
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: 'directory=${Uri.encodeQueryComponent(directory)}',
+    );
+
+    if (response.statusCode != 200) {
+      final errorData = json.decode(utf8.decode(response.bodyBytes));
+      throw Exception(errorData['detail'] ?? 'Failed to embed documents');
+    }
+  }
 }
