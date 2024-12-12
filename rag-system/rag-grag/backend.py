@@ -18,66 +18,74 @@ tokenizer = None
 model = None
 
 def init_milvus_collection(host="localhost", port="19530", collection_name="document_embeddings"):
-    """
-    Initialize the Milvus connection, create or recreate the document_embeddings collection and index.
-    """
     global collection
     # Connect to Milvus
     connections.connect("default", host=host, port=port)
 
-    # Define Milvus collection schema with auto_id=False
-    fields = [
-        FieldSchema(name="document_id", dtype=DataType.INT64, is_primary=True, auto_id=False),
-        FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=256),
-    ]
-    schema = CollectionSchema(fields, description="Document Embeddings")
+    # Check if collection exists
+    if collection_name not in utility.list_collections():
+        fields = [
+            FieldSchema(name="document_id", dtype=DataType.INT64, is_primary=True, auto_id=False),
+            FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=256),
+        ]
+        schema = CollectionSchema(fields, description="Document Embeddings")
 
-    # Clear existing collection if it exists and recreate it
-    if collection_name in utility.list_collections():
-        with Halo(text=f"Collection '{collection_name}' exists. Dropping it to clear the database...", spinner="dots") as spinner:
-            existing_collection = Collection(name=collection_name)
-            existing_collection.drop()
-            spinner.succeed(f"Collection '{collection_name}' dropped successfully.")
+        with Halo(text=f"Creating Milvus collection '{collection_name}' since it does not exist...", spinner="dots") as spinner:
+            collection = Collection(name=collection_name, schema=schema)
+            spinner.succeed(f"Collection '{collection_name}' created successfully.")
 
-    # Create a new collection
-    collection = Collection(name=collection_name, schema=schema)
+        # Create an index for the "embedding" field
+        index_params = {
+            "index_type": IndexType.HNSW,
+            "metric_type": "COSINE",
+            "params": {"M": 16, "efConstruction": 200}
+        }
 
-    # Create an index for the "embedding" field
-    index_params = {
-        "index_type": IndexType.HNSW,
-        "metric_type": "COSINE",
-        "params": {"M": 16, "efConstruction": 200}
-    }
+        with Halo(text="Creating index on the embedding field...", spinner="dots") as spinner:
+            Index(collection, "embedding", index_params)
+            spinner.succeed("Index created successfully.")
 
-    with Halo(text="Creating index on the embedding field...", spinner="dots") as spinner:
-        Index(collection, "embedding", index_params)
-        spinner.succeed("Index created successfully.")
+        # Load the collection to be ready for search and insert
+        collection.load()
+    else:
+        with Halo(text=f"Loading existing Milvus collection '{collection_name}'...", spinner="dots") as spinner:
+            collection = Collection(collection_name)
+            collection.load()
+            spinner.succeed(f"Collection '{collection_name}' loaded successfully.")
 
-    # Load the collection to be ready for search and insert
-    collection.load()
 
 def init_neo4j(neo4j_uri="bolt://localhost:7687", neo4j_user="neo4j", neo4j_password="testtest"):
-    """
-    Initialize the Neo4j driver.
-    """
     global driver
     driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
 
+
 def init_model(model_name="Seznam/retromae-small-cs"):
-    """
-    Initialize the Hugging Face transformer model and tokenizer for embedding documents.
-    """
     global tokenizer, model
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModel.from_pretrained(model_name)
 
-def clear_neo4j_graph():
+def clear_neo4j_graph(batch_size=10):
     """
-    Clear all nodes and relationships from the Neo4j graph.
+    Clear all nodes and relationships from the Neo4j graph in batches.
+    This avoids memory errors by not deleting all nodes in one large transaction.
     """
     with driver.session() as session:
-        with Halo(text="Clearing Neo4j graph...", spinner="dots") as spinner:
-            session.run("MATCH (n) DETACH DELETE n")
+        with Halo(text="Clearing Neo4j graph in batches...", spinner="dots") as spinner:
+            deleted = batch_size
+            while deleted == batch_size:
+                # Delete up to `batch_size` nodes at a time
+                result = session.run(f"""
+                MATCH (n)
+                WITH n LIMIT {batch_size}
+                DETACH DELETE n
+                RETURN count(*) AS count
+                """)
+                record = result.single()
+                deleted = record["count"] if record else 0
+
+                # If no nodes were deleted in this batch, we are done
+                if deleted == 0:
+                    break
             spinner.succeed("Neo4j graph cleared successfully.")
 
 def generate_doc_id(content):
@@ -96,13 +104,8 @@ def store_embeddings(doc_ids, embeddings):
     collection.insert([doc_ids, embeddings.tolist()])
     collection.flush()
 
-def create_document_node(doc_id, content, metadata):
-    """
-    Create a document node in Neo4j.
-    """
-    metadata_json = json.dumps(metadata)
-    with driver.session() as session:
-        session.run("""
+def _create_document_node_tx(tx, doc_id, content, metadata_json):
+    tx.run("""
         CREATE (d:Document {
             doc_id: $doc_id,
             content: $content,
@@ -110,22 +113,30 @@ def create_document_node(doc_id, content, metadata):
             is_global: true,
             workspace_id: null
         })
-        """, doc_id=doc_id, content=content, metadata_json=metadata_json)
+    """, doc_id=doc_id, content=content, metadata_json=metadata_json)
+
+def create_document_node(doc_id, content, metadata):
+    """
+    Create a document node in Neo4j using a write transaction.
+    """
+    metadata_json = json.dumps(metadata)
+    with driver.session() as session:
+        session.write_transaction(_create_document_node_tx, doc_id, content, metadata_json)
+
+def _create_relationship_tx(tx, doc_id_1, doc_id_2, relationship_type, extra_data):
+    tx.run("""
+        MATCH (d1:Document {doc_id: $doc_id_1}), (d2:Document {doc_id: $doc_id_2})
+        CREATE (d1)-[:RELATED {type: $relationship_type, extra: $extra_data}]->(d2)
+    """, doc_id_1=doc_id_1, doc_id_2=doc_id_2, relationship_type=relationship_type, extra_data=json.dumps(extra_data or {}))
 
 def create_relationship(doc_id_1, doc_id_2, relationship_type, extra_data=None):
     """
-    Create a relationship between two documents in Neo4j.
+    Create a relationship between two documents in Neo4j using a write transaction.
     """
     if extra_data and "score" in extra_data:
         extra_data["score"] = float(extra_data["score"])  # Ensure float32 is converted to float
     with driver.session() as session:
-        result = session.run("""
-        MATCH (d1:Document {doc_id: $doc_id_1}), (d2:Document {doc_id: $doc_id_2})
-        CREATE (d1)-[:RELATED {type: $relationship_type, extra: $extra_data}]->(d2)
-        RETURN d1, d2
-        """, doc_id_1=doc_id_1, doc_id_2=doc_id_2, relationship_type=relationship_type, extra_data=json.dumps(extra_data or {}))
-        if result.peek() is None:
-            print(f"Failed to create relationship: {doc_id_1} -> {doc_id_2}")
+        session.write_transaction(_create_relationship_tx, doc_id_1, doc_id_2, relationship_type, extra_data or {})
 
 def cosine_similarity(embedding1, embedding2):
     """
@@ -194,41 +205,30 @@ def extract_metadata(file_path, content):
         metadata["type"] = "Text"
     return metadata
 
-def process_documents(directory):
+def process_batch(docs_batch, directory):
     """
-    Process and embed documents from a directory, store them in Milvus and Neo4j, and compute relationships.
+    Process a batch of documents, create nodes, embeddings, and relationships.
+    Each write operation is done in its own transaction to reduce memory usage.
     """
-    docs = {}
     embeddings = []
     doc_ids = []
+    doc_map = {}
 
-    # Clear the Neo4j graph before processing
-    clear_neo4j_graph()
+    # Insert documents and compute embeddings
+    for (filename, doc_id, content, metadata) in docs_batch:
+        links, _ = extract_links_and_references(content, doc_map)
+        metadata["links"] = [link.split("/")[-1] for link in links]
+        doc_map[filename] = doc_id
 
-    # Collect all documents
-    for filename in os.listdir(directory):
-        file_path = os.path.join(directory, filename)
-        try:
-            content = read_file_content(file_path)
-            if content:
-                doc_id = generate_doc_id(content)
-                metadata = extract_metadata(file_path, content)
-                links, _ = extract_links_and_references(content, docs)
-                metadata["links"] = [link.split("/")[-1] for link in links]
-                docs[filename] = doc_id
-                create_document_node(doc_id, content, metadata)
+        # Create document node
+        create_document_node(doc_id, content, metadata)
 
-                # Generate embeddings
-                with Halo(text=f"Generating embeddings for {filename}...", spinner="dots") as spinner:
-                    inputs = tokenizer(content, return_tensors="pt", truncation=True, padding=True, max_length=128)
-                    with torch.no_grad():
-                        embedding = model(**inputs).last_hidden_state.mean(dim=1).squeeze().numpy()
-                    embeddings.append(embedding)
-                    doc_ids.append(doc_id)
-                    spinner.succeed(f"Embedding generated for {filename}.")
-
-        except Exception as e:
-            print(f"Error processing file {file_path}: {e}")
+        # Generate embedding
+        inputs = tokenizer(content, return_tensors="pt", truncation=True, padding=True, max_length=128)
+        with torch.no_grad():
+            embedding = model(**inputs).last_hidden_state.mean(dim=1).squeeze().numpy()
+        embeddings.append(embedding)
+        doc_ids.append(doc_id)
 
     # Compute similarities and store relationships
     for i, embedding in enumerate(embeddings):
@@ -236,36 +236,56 @@ def process_documents(directory):
 
     # Store embeddings in Milvus
     if embeddings:
-        with Halo(text=f"Storing {len(embeddings)} documents in Milvus...", spinner="dots") as spinner:
-            store_embeddings(doc_ids, embeddings)
-            spinner.succeed(f"Stored {len(embeddings)} documents successfully in Milvus.")
-    else:
-        print("No embeddings to store.")
+        store_embeddings(doc_ids, embeddings)
 
-    # Store links explicitly found in the documents
-    with Halo(text="Storing explicit document links in Neo4j...", spinner="dots") as spinner:
-        for filename, doc_id in docs.items():
-            links, relationships = extract_links_and_references(read_file_content(os.path.join(directory, filename)), docs)
-            for target_doc_id, _ in relationships:
-                create_relationship(doc_id, target_doc_id, "LINK", extra_data={"source": filename})
-        spinner.succeed("Explicit document links stored successfully.")
+    # Store explicit links
+    for (filename, doc_id, content, metadata) in docs_batch:
+        links, relationships = extract_links_and_references(content, doc_map)
+        for target_doc_id, _ in relationships:
+            create_relationship(doc_id, target_doc_id, "LINK", extra_data={"source": filename})
+
+def process_documents(directory, batch_size=50):
+    """
+    Process and embed documents from a directory in batches,
+    store them in Milvus and Neo4j, and compute relationships.
+    """
+    # Clear the Neo4j graph in batches to prevent memory issues
+    clear_neo4j_graph()
+
+    # Collect all documents first
+    docs = []
+    for filename in os.listdir(directory):
+        file_path = os.path.join(directory, filename)
+        content = read_file_content(file_path)
+        if content:
+            doc_id = generate_doc_id(content)
+            metadata = extract_metadata(file_path, content)
+            docs.append((filename, doc_id, content, metadata))
+
+    # Process in batches
+    for i in range(0, len(docs), batch_size):
+        batch = docs[i:i+batch_size]
+        process_batch(batch, directory)
 
 def initialize_all(neo4j_uri="bolt://localhost:7687", neo4j_user="neo4j", neo4j_password="testtest", milvus_host="localhost", milvus_port="19530"):
-    """
-    Initialize all connections and models required.
-    """
     init_milvus_collection(host=milvus_host, port=milvus_port, collection_name="document_embeddings")
     init_neo4j(neo4j_uri=neo4j_uri, neo4j_user=neo4j_user, neo4j_password=neo4j_password)
     init_model()
 
+# Note:
+# If you still encounter memory issues, consider:
+# - Further reducing batch_size in clear_neo4j_graph or process_documents
+# - Increasing Neo4j memory in neo4j.conf (dbms.memory.transaction.total.max)
+# - Ensuring your machine has enough RAM
+
 # Optional: enable standalone testing
 if __name__ == "__main__":
-    directory = "/path/to/your/documents"
+    directory = "/home/marek/rag-documents/global/"
     if os.path.isdir(directory):
         initialize_all()
         with Halo(text="Starting document processing...", spinner="dots") as spinner:
             try:
-                process_documents(directory)
+                process_documents(directory, batch_size=50)
                 spinner.succeed("Document processing completed successfully.")
             except Exception as e:
                 spinner.fail(f"An error occurred during processing: {e}")
