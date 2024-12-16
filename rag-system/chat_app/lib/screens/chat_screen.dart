@@ -1,7 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:chat_app/api/api_service.dart';
-import 'package:chat_app/widgets/common_app_bar.dart'; // Import the common app bar
+import 'package:file_picker/file_picker.dart';
+import 'package:chat_app/widgets/common_app_bar.dart';
 
 class ChatScreen extends StatefulWidget {
   @override
@@ -20,7 +21,7 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
-    fetchAllChats(); // Fetch all existing chats when the screen loads
+    fetchAllChats();
   }
 
   Future<void> fetchAllChats() async {
@@ -46,8 +47,6 @@ class _ChatScreenState extends State<ChatScreen> {
       currentChatName = chatName;
 
       final history = await apiService.getChatHistory(chatId);
-      print("Chat history received: ${history['history']}");
-
       setState(() {
         messages.clear();
 
@@ -86,13 +85,10 @@ class _ChatScreenState extends State<ChatScreen> {
             "isUser": currentSpeaker == "User",
           });
         }
-
-        print("Parsed messages: $messages");
       });
 
       _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
     } catch (e) {
-      print("Error loading chat history: $e");
       setState(() {
         messages.add({"message": "Failed to load chat history", "isUser": false});
       });
@@ -132,9 +128,37 @@ class _ChatScreenState extends State<ChatScreen> {
 
       _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
     } catch (e) {
-      print("Error: $e");
       setState(() {
         messages.add({"message": "Failed to send message", "isUser": false});
+      });
+    }
+  }
+
+  Future<void> embedDocument() async {
+    if (currentChatId == null) {
+      setState(() {
+        messages.add({
+          "message": "Cannot embed a document in a new chat. Please send a message first.",
+          "isUser": false
+        });
+      });
+      return;
+    }
+
+    try {
+      FilePickerResult? result = await FilePicker.platform.pickFiles();
+      if (result == null) return;
+
+      final filePath = result.files.single.path;
+      if (filePath == null) return;
+
+      final response = await apiService.uploadDocument(filePath, "chat", chatId: currentChatId!);
+      setState(() {
+        messages.add({"message": "Document embedded successfully.", "isUser": false});
+      });
+    } catch (e) {
+      setState(() {
+        messages.add({"message": "Failed to embed document: $e", "isUser": false});
       });
     }
   }
@@ -150,7 +174,6 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      // Use CommonAppBar here with a title and the current ApiService
       appBar: CommonAppBar(apiService: apiService, title: currentChatName ?? "Select a Chat"),
       drawer: Drawer(
         child: ListView(
@@ -188,12 +211,10 @@ class _ChatScreenState extends State<ChatScreen> {
           Expanded(
             child: ListView.builder(
               controller: _scrollController,
-              key: ValueKey(messages.length),
               itemCount: messages.length,
               itemBuilder: (context, index) {
                 final chat = messages[index];
                 return ChatBubble(
-                  key: ValueKey(index),
                   message: chat['message'],
                   isUser: chat['isUser'],
                 );
@@ -204,6 +225,10 @@ class _ChatScreenState extends State<ChatScreen> {
             padding: const EdgeInsets.all(8.0),
             child: Row(
               children: [
+                IconButton(
+                  icon: Icon(Icons.add, color: Colors.pink),
+                  onPressed: embedDocument,
+                ),
                 Expanded(
                   child: TextField(
                     controller: messageController,
@@ -246,22 +271,13 @@ class ChatBubble extends StatelessWidget {
           borderRadius: BorderRadius.circular(15),
         ),
         child: isUser
-            ? Text(
-          message,
-          style: TextStyle(fontSize: 16, height: 1.5),
-          textDirection: TextDirection.ltr,
-        )
+            ? Text(message, style: TextStyle(fontSize: 16, height: 1.5))
             : MarkdownBody(
           data: message,
           styleSheet: MarkdownStyleSheet(
             p: TextStyle(fontSize: 16, height: 1.5),
             listBullet: TextStyle(fontSize: 16, height: 1.5),
           ),
-          onTapLink: (text, href, title) {
-            if (href != null) {
-              print("Tapped link: $href");
-            }
-          },
         ),
       ),
     );

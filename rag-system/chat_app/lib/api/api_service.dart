@@ -200,6 +200,19 @@ class ApiService {
     }
   }
 
+  Future<List<dynamic>> getUserWorkspaces(int userId) async {
+    final uri = Uri.parse('$baseUrl/workspaces/$userId/list');
+    final response = await http.get(uri, headers: authHeaders);
+
+    if (response.statusCode == 200) {
+      final data = json.decode(utf8.decode(response.bodyBytes));
+      return data['workspaces'] ?? [];
+    } else {
+      final errorData = json.decode(utf8.decode(response.bodyBytes));
+      throw Exception(errorData['detail'] ?? 'Failed to load user workspaces');
+    }
+  }
+
   Future<void> updateRole(String username, String newRole) async {
     final payload = {"username": username, "new_role": newRole};
     final response = await http.post(
@@ -217,11 +230,15 @@ class ApiService {
     }
   }
 
-  Future<Map<String, dynamic>> uploadDocument(String filePath, String scope) async {
+  Future<Map<String, dynamic>> uploadDocument(String filePath, String scope, {String? chatId}) async {
     var request = http.MultipartRequest('POST', Uri.parse('$baseUrl/documents'));
     request.headers.addAll(authHeaders);
     request.files.add(await http.MultipartFile.fromPath('file', filePath));
     request.fields['scope'] = scope;
+
+    if (scope == "chat" && chatId != null) {
+      request.fields['chat_id'] = chatId;
+    }
 
     final streamedResponse = await request.send();
     final response = await http.Response.fromStream(streamedResponse);

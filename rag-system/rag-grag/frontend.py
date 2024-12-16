@@ -356,21 +356,30 @@ def assign_user_to_workspace(workspace_id: int, request: AssignUserRequest, curr
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
     try:
-        cursor.execute("UPDATE users SET workspace_id = %s WHERE id = %s", (workspace_id, request.user_id))
+        cursor.execute(
+            "INSERT INTO user_workspaces (user_id, workspace_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+            (request.user_id, workspace_id)
+        )
         connection.commit()
         return {"message": f"User {request.user_id} assigned to workspace {workspace_id}"}
     finally:
         cursor.close()
         connection.close()
 
+
 @app.post("/documents")
 def upload_document(
-    file: UploadFile = File(...),
-    scope: str = Form(...),
-    current_user=Depends(role_required(["user", "admin", "superadmin"]))
+        file: UploadFile = File(...),
+        scope: str = Form(...),
+        chat_id: Optional[str] = Form(None),
+        current_user=Depends(role_required(["user", "admin", "superadmin"]))
 ):
     if scope not in ["chat", "profile", "workspace", "system"]:
         raise HTTPException(status_code=400, detail="Invalid scope")
+
+    if scope == "chat" and not chat_id:
+        raise HTTPException(status_code=400, detail="chat_id is required for chat scope")
+
     if scope == "workspace" and current_user["role"] not in ["admin", "superadmin"]:
         raise HTTPException(status_code=403, detail="Admins and Superadmins only")
     if scope == "system" and current_user["role"] != "superadmin":
@@ -380,13 +389,15 @@ def upload_document(
     doc_id = hashlib.sha256(file_content.encode()).hexdigest()
     metadata = {"filename": file.filename, "scope": scope}
 
-    if scope in ["chat", "profile"]:
-        is_global = True
+    # Handle chat-specific metadata
+    if scope == "chat":
+        metadata["chat_id"] = chat_id
+        is_global = False
         doc_workspace_id = None
     elif scope == "workspace":
         is_global = False
         doc_workspace_id = current_user["workspace_id"]
-    else:  # system
+    else:  # profile or system
         is_global = False
         doc_workspace_id = None
 
@@ -394,7 +405,8 @@ def upload_document(
         session.run("""
             CREATE (d:Document {doc_id: $doc_id, content: $content, metadata: $metadata, is_global: $is_global, workspace_id: $doc_workspace_id})
         """,
-        doc_id=doc_id, content=file_content, metadata=json.dumps(metadata), is_global=is_global, doc_workspace_id=doc_workspace_id)
+                    doc_id=doc_id, content=file_content, metadata=json.dumps(metadata), is_global=is_global,
+                    doc_workspace_id=doc_workspace_id)
 
     return {"message": f"Document uploaded successfully with scope {scope}"}
 
@@ -591,3 +603,21 @@ def embed_documents(directory: str = Form(...), current_user=Depends(role_requir
         return {"message": f"Documents in {directory} processed and embedded successfully."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/workspaces/{user_id}/list")
+def get_user_workspaces(user_id: int, current_user=Depends(role_required(["admin", "superadmin"]))):
+    connection = psycopg2.connect(**DB_CONFIG)
+    cursor = connection.cursor()
+    try:
+        cursor.execute("""
+            SELECT w.id, w.name
+            FROM workspaces w
+            JOIN user_workspaces uw ON w.id = uw.workspace_id
+            WHERE uw.user_id = %s
+        """, (user_id,))
+        result = cursor.fetchall()
+        workspaces = [{"workspace_id": row[0], "name": row[1]} for row in result]
+        return {"workspaces": workspaces}
+    finally:
+        cursor.close()
+        connection.close()

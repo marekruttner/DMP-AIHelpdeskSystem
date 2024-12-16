@@ -11,25 +11,23 @@ class AdminScreen extends StatefulWidget {
 class _AdminScreenState extends State<AdminScreen> {
   final ApiService apiService = ApiService();
 
+  // Controllers
   final TextEditingController workspaceNameController = TextEditingController();
   final TextEditingController assignUserIdController = TextEditingController();
   final TextEditingController assignWorkspaceIdController = TextEditingController();
   final TextEditingController roleUsernameController = TextEditingController();
-  String selectedRole = "user";
-
   final TextEditingController filePathController = TextEditingController();
-  String selectedScope = "chat";
-
-  String statusMessage = "";
-
-  // New controller for the embed documents directory
   final TextEditingController embedDirectoryController = TextEditingController();
-
-  // User management variables
-  List<dynamic> allUsers = [];
-  Map<int, List<dynamic>> userChatsMap = {}; // cache user chats
   final TextEditingController newUsernameController = TextEditingController();
   final TextEditingController newPasswordController = TextEditingController();
+
+  // Variables
+  String selectedRole = "user";
+  String selectedScope = "chat";
+  String statusMessage = "";
+  List<dynamic> allUsers = [];
+  Map<int, List<dynamic>> userWorkspacesMap = {};
+  Map<int, List<dynamic>> userChatsMap = {};
 
   @override
   void initState() {
@@ -50,6 +48,48 @@ class _AdminScreenState extends State<AdminScreen> {
           statusMessage = "Error loading users: $e";
         });
       }
+    }
+  }
+
+  Future<void> fetchUserWorkspaces(int userId) async {
+    try {
+      final workspaces = await apiService.getUserWorkspaces(userId);
+      setState(() {
+        userWorkspacesMap[userId] = workspaces;
+      });
+    } catch (e) {
+      setState(() {
+        statusMessage = "Error fetching workspaces: $e";
+      });
+    }
+  }
+
+  Future<void> fetchUserChats(int userId) async {
+    try {
+      final chats = await apiService.getUserChats(userId);
+      setState(() {
+        userChatsMap[userId] = chats;
+      });
+    } catch (e) {
+      setState(() {
+        statusMessage = "Error loading user chats: $e";
+      });
+    }
+  }
+
+  Future<void> assignUserToWorkspace() async {
+    try {
+      int workspaceId = int.parse(assignWorkspaceIdController.text.trim());
+      int userId = int.parse(assignUserIdController.text.trim());
+      await apiService.assignUserToWorkspace(workspaceId, userId);
+      setState(() {
+        statusMessage = "Assigned user $userId to workspace $workspaceId";
+      });
+      await fetchUserWorkspaces(userId);
+    } catch (e) {
+      setState(() {
+        statusMessage = "Error assigning user: $e";
+      });
     }
   }
 
@@ -88,19 +128,6 @@ class _AdminScreenState extends State<AdminScreen> {
     }
   }
 
-  Future<void> viewUserChats(int userId) async {
-    try {
-      final chats = await apiService.getUserChats(userId);
-      setState(() {
-        userChatsMap[userId] = chats;
-      });
-    } catch (e) {
-      setState(() {
-        statusMessage = "Error loading user chats: $e";
-      });
-    }
-  }
-
   Future<void> createWorkspace() async {
     try {
       final result = await apiService.createWorkspace(workspaceNameController.text.trim());
@@ -111,41 +138,6 @@ class _AdminScreenState extends State<AdminScreen> {
       setState(() {
         statusMessage = "Error creating workspace: $e";
       });
-    }
-  }
-
-  Future<void> assignUserToWorkspace() async {
-    try {
-      int workspaceId = int.parse(assignWorkspaceIdController.text.trim());
-      int userId = int.parse(assignUserIdController.text.trim());
-      final result = await apiService.assignUserToWorkspace(workspaceId, userId);
-      setState(() {
-        statusMessage = "Assigned user $userId to workspace $workspaceId";
-      });
-    } catch (e) {
-      setState(() {
-        statusMessage = "Error assigning user: $e";
-      });
-    }
-  }
-
-  Future<void> updateUserRole() async {
-    try {
-      await apiService.updateRole(roleUsernameController.text.trim(), selectedRole);
-      setState(() {
-        statusMessage = "User role updated successfully";
-      });
-    } catch (e) {
-      setState(() {
-        statusMessage = "Error updating role: $e";
-      });
-    }
-  }
-
-  Future<void> pickFile() async {
-    FilePickerResult? result = await FilePicker.platform.pickFiles();
-    if (result != null) {
-      filePathController.text = result.files.single.path ?? "";
     }
   }
 
@@ -164,6 +156,33 @@ class _AdminScreenState extends State<AdminScreen> {
     } catch (e) {
       setState(() {
         statusMessage = "Error uploading document: $e";
+      });
+    }
+  }
+
+  Future<void> pickFile() async {
+    FilePickerResult? result = await FilePicker.platform.pickFiles();
+    if (result != null) {
+      filePathController.text = result.files.single.path ?? "";
+    }
+  }
+
+  Future<void> embedDocuments() async {
+    final directory = embedDirectoryController.text.trim();
+    if (directory.isEmpty) {
+      setState(() {
+        statusMessage = "Directory path cannot be empty.";
+      });
+      return;
+    }
+    try {
+      await apiService.embedDocuments(directory);
+      setState(() {
+        statusMessage = "Documents embedded successfully from $directory.";
+      });
+    } catch (e) {
+      setState(() {
+        statusMessage = "Error embedding documents: $e";
       });
     }
   }
@@ -192,7 +211,7 @@ class _AdminScreenState extends State<AdminScreen> {
                 padding: const EdgeInsets.only(bottom: 20),
                 child: Text(statusMessage, style: TextStyle(fontSize: 16, color: Colors.blue)),
               ),
-
+            // Workspace Management
             Card(
               child: Padding(
                 padding: EdgeInsets.all(16),
@@ -244,149 +263,7 @@ class _AdminScreenState extends State<AdminScreen> {
                 ),
               ),
             ),
-
-            SizedBox(height: 20),
-
-            if (role == "superadmin")
-              Card(
-                child: Padding(
-                  padding: EdgeInsets.all(16),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text("Update User Role", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-                      SizedBox(height: 10),
-                      TextField(
-                        controller: roleUsernameController,
-                        decoration: InputDecoration(
-                          labelText: "Username",
-                          border: OutlineInputBorder(),
-                        ),
-                      ),
-                      SizedBox(height: 10),
-                      DropdownButton<String>(
-                        value: selectedRole,
-                        items: ["user", "admin", "superadmin"].map((r) {
-                          return DropdownMenuItem(value: r, child: Text(r));
-                        }).toList(),
-                        onChanged: (val) {
-                          if (val != null) {
-                            setState(() {
-                              selectedRole = val;
-                            });
-                          }
-                        },
-                      ),
-                      ElevatedButton(
-                        onPressed: updateUserRole,
-                        style: ElevatedButton.styleFrom(backgroundColor: Colors.pink),
-                        child: Text("Update Role"),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-
-            SizedBox(height: 20),
-
-// Show Embed Documents card only if user is superadmin
-            if (role == "superadmin")
-              Card(
-                child: Padding(
-                  padding: EdgeInsets.all(16),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text("Embed Documents", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-                      SizedBox(height: 10),
-                      TextField(
-                        controller: embedDirectoryController,
-                        decoration: InputDecoration(
-                          labelText: "Directory Path",
-                          border: OutlineInputBorder(),
-                        ),
-                      ),
-                      SizedBox(height: 10),
-                      ElevatedButton(
-                        onPressed: () async {
-                          final directory = embedDirectoryController.text.trim();
-                          if (directory.isEmpty) {
-                            setState(() {
-                              statusMessage = "Directory path cannot be empty.";
-                            });
-                            return;
-                          }
-                          try {
-                            await apiService.embedDocuments(directory);
-                            setState(() {
-                              statusMessage = "Documents embedded successfully from $directory.";
-                            });
-                          } catch (e) {
-                            setState(() {
-                              statusMessage = "Error embedding documents: $e";
-                            });
-                          }
-                        },
-                        style: ElevatedButton.styleFrom(backgroundColor: Colors.pink),
-                        child: Text("Start Embedding"),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-
-            SizedBox(height: 20),
-
-            Card(
-              child: Padding(
-                padding: EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text("Upload Document", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-                    SizedBox(height: 10),
-                    TextField(
-                      controller: filePathController,
-                      decoration: InputDecoration(
-                        labelText: "File Path",
-                        border: OutlineInputBorder(),
-                      ),
-                      readOnly: true,
-                    ),
-                    SizedBox(height: 10),
-                    ElevatedButton(
-                      onPressed: pickFile,
-                      style: ElevatedButton.styleFrom(backgroundColor: Colors.pink),
-                      child: Text("Pick File"),
-                    ),
-                    SizedBox(height: 10),
-                    Text("Scope:"),
-                    DropdownButton<String>(
-                      value: selectedScope,
-                      items: ["chat", "profile", "workspace", "system"].map((scope) {
-                        return DropdownMenuItem(value: scope, child: Text(scope));
-                      }).toList(),
-                      onChanged: (val) {
-                        if (val != null) {
-                          setState(() {
-                            selectedScope = val;
-                          });
-                        }
-                      },
-                    ),
-                    SizedBox(height: 10),
-                    ElevatedButton(
-                      onPressed: uploadDocument,
-                      style: ElevatedButton.styleFrom(backgroundColor: Colors.pink),
-                      child: Text("Upload Document"),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-
-            SizedBox(height: 20),
-
+            // User Management
             if (role == "superadmin" && allUsers.isNotEmpty)
               Card(
                 child: Padding(
@@ -410,7 +287,6 @@ class _AdminScreenState extends State<AdminScreen> {
                                   children: [
                                     ElevatedButton(
                                       onPressed: () {
-                                        // Show dialog to change username
                                         showDialog(
                                             context: context,
                                             builder: (context) {
@@ -431,8 +307,7 @@ class _AdminScreenState extends State<AdminScreen> {
                                                   )
                                                 ],
                                               );
-                                            }
-                                        );
+                                            });
                                       },
                                       style: ElevatedButton.styleFrom(backgroundColor: Colors.blue),
                                       child: Text("Change Username"),
@@ -440,7 +315,6 @@ class _AdminScreenState extends State<AdminScreen> {
                                     SizedBox(width: 10),
                                     ElevatedButton(
                                       onPressed: () {
-                                        // Show dialog to change password
                                         showDialog(
                                             context: context,
                                             builder: (context) {
@@ -462,8 +336,7 @@ class _AdminScreenState extends State<AdminScreen> {
                                                   )
                                                 ],
                                               );
-                                            }
-                                        );
+                                            });
                                       },
                                       style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
                                       child: Text("Change Password"),
@@ -471,7 +344,7 @@ class _AdminScreenState extends State<AdminScreen> {
                                     SizedBox(width: 10),
                                     ElevatedButton(
                                       onPressed: () {
-                                        viewUserChats(user['id']);
+                                        fetchUserChats(user['id']);
                                       },
                                       style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
                                       child: Text("View Chats"),
@@ -495,6 +368,33 @@ class _AdminScreenState extends State<AdminScreen> {
                         ),
                         SizedBox(height: 10),
                       ]
+                    ],
+                  ),
+                ),
+              ),
+            // Embed Documents
+            if (role == "superadmin")
+              Card(
+                child: Padding(
+                  padding: EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text("Embed Documents", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                      SizedBox(height: 10),
+                      TextField(
+                        controller: embedDirectoryController,
+                        decoration: InputDecoration(
+                          labelText: "Directory Path",
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      SizedBox(height: 10),
+                      ElevatedButton(
+                        onPressed: embedDocuments,
+                        style: ElevatedButton.styleFrom(backgroundColor: Colors.pink),
+                        child: Text("Start Embedding"),
+                      ),
                     ],
                   ),
                 ),
