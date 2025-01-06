@@ -9,6 +9,7 @@ from google.oauth2.credentials import Credentials as GoogleCredentials
 from googleapiclient.discovery import build
 from msal import ConfidentialClientApplication
 from abc import ABC, abstractmethod
+from azure.storage.blob import BlobServiceClient
 
 # Base Datalake Interface
 class DataLake(ABC):
@@ -19,6 +20,28 @@ class DataLake(ABC):
     @abstractmethod
     def load_file(self, file_path: str) -> bytes:
         pass
+
+
+class LocalFileDataLake(DataLake):
+    def __init__(self):
+        self.base_path = os.environ.get("LOCAL_DATALAKE_PATH", "local_datalake")
+
+    def save_file_with_metadata(self, file_content: bytes, file_path: str, metadata: dict):
+        full_file_path = os.path.join(self.base_path, file_path)
+        os.makedirs(os.path.dirname(full_file_path), exist_ok=True)
+
+        with open(full_file_path, 'wb') as f:
+            f.write(file_content)
+
+        meta_path = full_file_path + ".metadata.json"
+        with open(meta_path, 'w', encoding='utf-8') as mf:
+            json.dump(metadata, mf, ensure_ascii=False, indent=2)
+
+    def load_file(self, file_path: str) -> bytes:
+        full_file_path = os.path.join(self.base_path, file_path)
+        with open(full_file_path, 'rb') as f:
+            return f.read()
+
 
 # S3 Implementation
 class S3DataLake(DataLake):
@@ -32,14 +55,12 @@ class S3DataLake(DataLake):
         self.bucket_name = os.environ.get("DATALAKE_BUCKET", "my-datalake-bucket")
 
     def save_file_with_metadata(self, file_content: bytes, file_path: str, metadata: dict):
-        # Save file content
         self.s3.put_object(
             Bucket=self.bucket_name,
             Key=file_path,
             Body=file_content,
             Metadata={k: str(v) for k, v in metadata.items() if isinstance(v, (str, int, float))}
         )
-        # Save metadata as a separate JSON file
         meta_path = file_path + ".metadata.json"
         self.s3.put_object(
             Bucket=self.bucket_name,
@@ -51,10 +72,39 @@ class S3DataLake(DataLake):
         resp = self.s3.get_object(Bucket=self.bucket_name, Key=file_path)
         return resp['Body'].read()
 
-# Azure Blob Storage Implementation (Example)
-# NOTE: This requires azure-storage-blob library.
-# pip install azure-storage-blob
-from azure.storage.blob import BlobServiceClient
+
+# MinIO Implementation (S3-Compatible)
+class MinioDataLake(DataLake):
+    def __init__(self):
+        self.minio_client = boto3.client(
+            's3',
+            endpoint_url=os.environ.get("MINIO_ENDPOINT", "http://localhost:9000"),
+            aws_access_key_id=os.environ.get("MINIO_ACCESS_KEY"),
+            aws_secret_access_key=os.environ.get("MINIO_SECRET_KEY"),
+            region_name="us-east-1",  # Typically not relevant for MinIO, but you can set any string
+            verify=False  # If using self-signed certificates, you may disable SSL verification
+        )
+        self.bucket_name = os.environ.get("MINIO_BUCKET", "my-minio-bucket")
+
+    def save_file_with_metadata(self, file_content: bytes, file_path: str, metadata: dict):
+        self.minio_client.put_object(
+            Bucket=self.bucket_name,
+            Key=file_path,
+            Body=file_content,
+            Metadata={k: str(v) for k, v in metadata.items() if isinstance(v, (str, int, float))}
+        )
+
+        meta_path = file_path + ".metadata.json"
+        self.minio_client.put_object(
+            Bucket=self.bucket_name,
+            Key=meta_path,
+            Body=json.dumps(metadata).encode('utf-8')
+        )
+
+    def load_file(self, file_path: str) -> bytes:
+        resp = self.minio_client.get_object(Bucket=self.bucket_name, Key=file_path)
+        return resp['Body'].read()
+
 
 class AzureBlobDataLake(DataLake):
     def __init__(self):
@@ -66,7 +116,6 @@ class AzureBlobDataLake(DataLake):
         blob_client = self.service_client.get_blob_client(container=self.container_name, blob=file_path)
         blob_client.upload_blob(file_content, overwrite=True, metadata=metadata)
 
-        # Save metadata separately if desired (not always needed because Azure supports metadata natively)
         meta_path = file_path + ".metadata.json"
         meta_blob_client = self.service_client.get_blob_client(container=self.container_name, blob=meta_path)
         meta_blob_client.upload_blob(json.dumps(metadata).encode('utf-8'), overwrite=True)
@@ -77,17 +126,19 @@ class AzureBlobDataLake(DataLake):
         return downloader.readall()
 
 
-# Add more datalake implementations here if needed, e.g., GCS, local filesystem, etc.
-
 def get_datalake(datalake_type: str) -> DataLake:
     """
     Factory method to get the appropriate datalake implementation.
-    datalake_type could be 's3', 'azureblob', etc.
+    datalake_type could be 's3', 'azureblob', 'local', 'minio' etc.
     """
     if datalake_type == 's3':
         return S3DataLake()
     elif datalake_type == 'azureblob':
         return AzureBlobDataLake()
+    elif datalake_type == 'local':
+        return LocalFileDataLake()
+    elif datalake_type == 'minio':
+        return MinioDataLake()
     else:
         raise ValueError(f"Unsupported datalake_type: {datalake_type}")
 

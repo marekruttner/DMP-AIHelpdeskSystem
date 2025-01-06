@@ -2,7 +2,6 @@ import os
 import hashlib
 import json
 import psycopg2
-import torch
 import numpy as np
 from langchain_community.llms import Ollama
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, Form, Request, File
@@ -56,11 +55,11 @@ SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 
+# Locks for concurrency control (optional, if your environment needs it)
 model_lock = threading.Lock()
 llm_lock = threading.Lock()
 
 # Initialize backend (Milvus, Neo4j, Model)
-# Using default or environment vars
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "testtest")
@@ -75,8 +74,20 @@ backend.initialize_all(
     milvus_port=MILVUS_PORT
 )
 
-# Initialize LLM
-llm = Ollama(model="llama3.1:8b")
+# Initialize LLM (you can choose any model in Ollama)
+llm = Ollama(model="mistral:7b")
+# If Ollama supports controlling max tokens, you can keep a default value here:
+# llm = Ollama(model="mistral:7b", max_tokens=512)  # Example only
+
+################################################################################
+# Constants to Prevent Overly Long Prompts
+################################################################################
+MAX_CONVERSATION_CHARS = 3000
+MAX_CONTEXT_CHARS = 3000
+
+################################################################################
+# Pydantic Models
+################################################################################
 
 class UserCredentials(BaseModel):
     username: str
@@ -108,6 +119,14 @@ class CreateWorkspaceRequest(BaseModel):
 
 class AssignUserRequest(BaseModel):
     user_id: int
+
+class StorageConfig(BaseModel):
+    datalake_type: str
+    config: dict
+
+################################################################################
+# Auth / Helpers
+################################################################################
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
@@ -156,28 +175,19 @@ def create_access_token(data: dict, expires_delta: Union[timedelta, None] = None
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-def generate_embeddings(texts, batch_size=32):
-    all_embeddings = []
-    for i in range(0, len(texts), batch_size):
-        batch_texts = texts[i:i + batch_size]
-        with model_lock:
-            inputs = backend.tokenizer(batch_texts, padding=True, truncation=True, return_tensors='pt', max_length=128)
-            with torch.no_grad():
-                outputs = backend.model(**inputs)
-                embeddings = outputs.last_hidden_state[:, 0, :].numpy()
-        all_embeddings.extend(embeddings)
-    return np.array(all_embeddings)
-
 def save_conversation(user_id, chat_id, query, response):
     connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
     try:
         sanitized_query = query.encode("utf-8", "replace").decode("utf-8")
         sanitized_response = response.encode("utf-8", "replace").decode("utf-8")
-        cursor.execute("""
+        cursor.execute(
+            """
             INSERT INTO user_conversations (user_id, chat_id, conversation)
             VALUES (%s, %s, %s)
-        """, (user_id, chat_id, f"User: {sanitized_query}\nAI: {sanitized_response}"))
+            """,
+            (user_id, chat_id, f"User: {sanitized_query}\nAI: {sanitized_response}")
+        )
         connection.commit()
     except Exception as e:
         print(f"Error saving conversation: {e}")
@@ -192,21 +202,32 @@ def role_required(required_roles: list):
         return current_user
     return decorator
 
-def get_relevant_docs_by_role_and_workspace(query, current_user):
-    # This function uses embeddings for the query but does not store any data,
-    # so it can remain here. We just refer to backend.collection and backend.driver.
-    query_embedding = generate_embeddings([query])[0]
+################################################################################
+# Retrieval: Using the new SentenceTransformer approach
+################################################################################
+
+def get_relevant_docs_by_role_and_workspace(query, current_user, top_k=3):
+    """
+    1. Embed the user query with the SentenceTransformer in backend.py
+    2. Retrieve top_k docs from Milvus (reduced from 5 to 3)
+    3. Filter by user role/workspace if needed
+    4. Return the doc content + metadata
+    """
+    with model_lock:
+        query_embedding = backend.embedding_model.encode([query])[0].astype(np.float32)
+
     search_params = {"metric_type": "COSINE", "params": {"ef": 128}}
     search_results = backend.collection.search(
         data=[query_embedding.tolist()],
         anns_field="embedding",
         param=search_params,
-        limit=5,
+        limit=top_k,
         output_fields=["document_id"]
     )
 
     relevant_doc_ids = [hit.entity.get("document_id") for hit in search_results[0]]
 
+    # Query Neo4j for docs
     with backend.driver.session() as session:
         if current_user["role"] == "superadmin":
             result = session.run("""
@@ -218,25 +239,32 @@ def get_relevant_docs_by_role_and_workspace(query, current_user):
             if current_user["workspace_id"] is not None:
                 result = session.run("""
                     MATCH (d:Document)
-                    WHERE d.doc_id IN $doc_ids AND (d.is_global = true OR d.workspace_id = $workspace_id)
+                    WHERE d.doc_id IN $doc_ids
+                      AND (d.is_global = true OR d.workspace_id = $workspace_id)
                     RETURN d.content AS content, d.metadata AS metadata
                 """, doc_ids=relevant_doc_ids, workspace_id=current_user["workspace_id"])
             else:
                 result = session.run("""
                     MATCH (d:Document)
-                    WHERE d.doc_id IN $doc_ids AND d.is_global = true
+                    WHERE d.doc_id IN $doc_ids
+                      AND d.is_global = true
                     RETURN d.content AS content, d.metadata AS metadata
                 """, doc_ids=relevant_doc_ids)
 
         documents = []
         for record in result:
-            metadata = json.loads(record['metadata'])
+            meta = json.loads(record['metadata'])
             documents.append({
-                'content': record['content'],
-                'metadata': metadata,
-                'filename': metadata.get('filename', 'Unknown')
+                "content": record["content"],
+                "metadata": meta,
+                "filename": meta.get("filename", "Unknown")
             })
+
     return documents
+
+################################################################################
+# Slack Helpers
+################################################################################
 
 async def verify_slack_signature(request: Request):
     timestamp = request.headers.get("X-Slack-Request-Timestamp")
@@ -254,8 +282,10 @@ async def verify_slack_signature(request: Request):
 
 async def process_slack_command(user_query: str, channel_id: str):
     try:
-        # Provide a fallback user context if needed
-        response = generate_response(QueryRequest(query=user_query, new_chat=True), current_user={"user_id": 1, "role": "superadmin", "workspace_id": None})
+        response = generate_response(
+            QueryRequest(query=user_query, new_chat=True),
+            current_user={"user_id": 1, "role": "superadmin", "workspace_id": None}
+        )
         slack_client.chat_postMessage(
             channel=channel_id,
             text=response.response
@@ -266,6 +296,20 @@ async def process_slack_command(user_query: str, channel_id: str):
             channel=channel_id,
             text="Sorry, something went wrong while processing your request."
         )
+
+def get_storage_settings():
+    """
+    Load the storage configuration from the JSON file.
+    """
+    config_path = "storage_config.json"
+    if not os.path.exists(config_path):
+        raise HTTPException(status_code=500, detail="Storage configuration not found.")
+    with open(config_path, "r") as f:
+        return json.load(f)
+
+################################################################################
+# Endpoints
+################################################################################
 
 @app.get("/chats", response_model=dict)
 def get_user_chats(current_user_id: int = Depends(get_current_user)):
@@ -339,7 +383,10 @@ def login_for_access_token(username: str = Form(...), password: str = Form(...))
         connection.close()
 
 @app.post("/workspaces")
-def create_workspace(request: CreateWorkspaceRequest, current_user=Depends(role_required(["admin", "superadmin"]))):
+def create_workspace(
+    request: CreateWorkspaceRequest,
+    current_user=Depends(role_required(["admin", "superadmin"]))
+):
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
     try:
@@ -352,7 +399,11 @@ def create_workspace(request: CreateWorkspaceRequest, current_user=Depends(role_
         connection.close()
 
 @app.post("/workspaces/{workspace_id}/assign-user")
-def assign_user_to_workspace(workspace_id: int, request: AssignUserRequest, current_user=Depends(role_required(["admin", "superadmin"]))):
+def assign_user_to_workspace(
+    workspace_id: int,
+    request: AssignUserRequest,
+    current_user=Depends(role_required(["admin", "superadmin"]))
+):
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
     try:
@@ -366,13 +417,12 @@ def assign_user_to_workspace(workspace_id: int, request: AssignUserRequest, curr
         cursor.close()
         connection.close()
 
-
 @app.post("/documents")
 def upload_document(
-        file: UploadFile = File(...),
-        scope: str = Form(...),
-        chat_id: Optional[str] = Form(None),
-        current_user=Depends(role_required(["user", "admin", "superadmin"]))
+    file: UploadFile = File(...),
+    scope: str = Form(...),
+    chat_id: Optional[str] = Form(None),
+    current_user=Depends(role_required(["user", "admin", "superadmin"]))
 ):
     if scope not in ["chat", "profile", "workspace", "system"]:
         raise HTTPException(status_code=400, detail="Invalid scope")
@@ -389,7 +439,6 @@ def upload_document(
     doc_id = hashlib.sha256(file_content.encode()).hexdigest()
     metadata = {"filename": file.filename, "scope": scope}
 
-    # Handle chat-specific metadata
     if scope == "chat":
         metadata["chat_id"] = chat_id
         is_global = False
@@ -397,21 +446,35 @@ def upload_document(
     elif scope == "workspace":
         is_global = False
         doc_workspace_id = current_user["workspace_id"]
-    else:  # profile or system
+    else:
         is_global = False
         doc_workspace_id = None
 
     with backend.driver.session() as session:
-        session.run("""
-            CREATE (d:Document {doc_id: $doc_id, content: $content, metadata: $metadata, is_global: $is_global, workspace_id: $doc_workspace_id})
-        """,
-                    doc_id=doc_id, content=file_content, metadata=json.dumps(metadata), is_global=is_global,
-                    doc_workspace_id=doc_workspace_id)
+        session.run(
+            """
+            CREATE (d:Document {
+                doc_id: $doc_id,
+                content: $content,
+                metadata: $metadata,
+                is_global: $is_global,
+                workspace_id: $doc_workspace_id
+            })
+            """,
+            doc_id=doc_id,
+            content=file_content,
+            metadata=json.dumps(metadata),
+            is_global=is_global,
+            doc_workspace_id=doc_workspace_id
+        )
 
     return {"message": f"Document uploaded successfully with scope {scope}"}
 
 @app.post("/chat", response_model=ChatResponse)
-def generate_response(request: QueryRequest, current_user=Depends(get_current_user_with_role)):
+def generate_response(
+    request: QueryRequest,
+    current_user=Depends(get_current_user_with_role)
+):
     print(f"Request received: {request.dict()}")
 
     if request.new_chat:
@@ -425,10 +488,16 @@ def generate_response(request: QueryRequest, current_user=Depends(get_current_us
         connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
         cursor = connection.cursor()
         try:
-            cursor.execute("""
-                SELECT conversation FROM user_conversations 
-                WHERE user_id = %s AND chat_id = %s ORDER BY id ASC
-            """, (current_user["user_id"], chat_id))
+            cursor.execute(
+                """
+                SELECT conversation 
+                FROM user_conversations 
+                WHERE user_id = %s 
+                  AND chat_id = %s 
+                ORDER BY id ASC
+                """,
+                (current_user["user_id"], chat_id)
+            )
             result = cursor.fetchall()
             conversation = "\n".join([record[0] for record in result])
         except Exception as e:
@@ -437,46 +506,61 @@ def generate_response(request: QueryRequest, current_user=Depends(get_current_us
             cursor.close()
             connection.close()
 
-    documents = get_relevant_docs_by_role_and_workspace(request.query, current_user)
-    max_docs = 5
-    documents = documents[:max_docs]
+    # Retrieve relevant docs (top_k=3 to keep context small)
+    documents = get_relevant_docs_by_role_and_workspace(request.query, current_user, top_k=3)
 
+    # Truncate conversation if too long
+    if len(conversation) > MAX_CONVERSATION_CHARS:
+        conversation = conversation[:MAX_CONVERSATION_CHARS] + " ... [truncated for length]"
+
+    # Build a context from the top documents
     context = ""
     for doc in documents:
-        content = doc['content']
-        filename = doc['filename']
-        content = content.encode('utf-8', errors='replace').decode('utf-8')
-        filename = filename.encode('utf-8', errors='replace').decode('utf-8')
+        content = doc['content'].encode('utf-8', errors='replace').decode('utf-8')
+        filename = doc['filename'].encode('utf-8', errors='replace').decode('utf-8')
         context += f"{content}\n(Source: {filename})\n\n"
 
+    # Truncate context if too long
+    if len(context) > MAX_CONTEXT_CHARS:
+        context = context[:MAX_CONTEXT_CHARS] + " ... [truncated for length]"
+
+    # Build final prompt
     prompt = f"""
-        You are a helpdesk assistant who assists users based on information from the provided documents.
+You are a helpdesk assistant who assists users with short, clear, step-by-step solutions.
+Conversation so far:
+{conversation}
 
-        Your primary goal is to help users solve their problems by providing simple, clear, and step-by-step instructions suitable for non-technical individuals.
+Relevant context:
+{context}
 
-        Previous conversation:
-        {conversation}
+Question:
+{request.query}
 
-        Context:
-        {context}
+Your concise and helpful Answer:
+""".strip()
 
-        Question:
-        {request.query}
-
-        Your kind and helpful Answer:
-    """
-
+    # Generate response with Ollama (optionally limit tokens if supported)
     with llm_lock:
+        # If Ollama in your environment supports max_tokens or similar param, you can pass it here:
+        # response_text = llm.invoke(prompt, options={"max_tokens": 512}).strip()
         response_text = llm.invoke(prompt).strip()
+
+    # Clean up response
     response_text = response_text.encode('utf-8', errors='replace').decode('utf-8')
 
+    # Save conversation to DB
     save_conversation(current_user["user_id"], chat_id, request.query, response_text)
 
+    # Prepare sources
     source_names = ", ".join([doc['filename'] for doc in documents])
     source_names = source_names.encode('utf-8', errors='replace').decode('utf-8')
-    formatted_response = f"{response_text}\n\nSources:\n{source_names.replace(',', '\n')}"
+    formatted_response = f"{response_text}\n\nSources:\n{source_names.replace(',', '\\n')}"
 
-    return {"response": formatted_response, "sources": source_names, "chat_id": chat_id}
+    return {
+        "response": formatted_response,
+        "sources": source_names,
+        "chat_id": chat_id
+    }
 
 @app.post("/slack/events")
 async def slack_events(request: Request):
@@ -490,11 +574,11 @@ async def slack_events(request: Request):
         channel_id = event.get("channel")
 
         try:
-            response = generate_response(QueryRequest(query=user_query, new_chat=True), current_user={"user_id":1,"role":"superadmin","workspace_id":None})
-            slack_client.chat_postMessage(
-                channel=channel_id,
-                text=response.response
+            response = generate_response(
+                QueryRequest(query=user_query, new_chat=True),
+                current_user={"user_id": 1, "role": "superadmin", "workspace_id": None}
             )
+            slack_client.chat_postMessage(channel=channel_id, text=response.response)
         except SlackApiError as e:
             print(f"Error sending message: {e.response['error']}")
 
@@ -513,14 +597,20 @@ async def slack_command(request: Request, background_tasks: BackgroundTasks):
     return JSONResponse(content={"response_type": "ephemeral", "text": "Processing your request..."})
 
 @app.post("/update-role")
-def update_role(request: UpdateRoleRequest, current_user=Depends(role_required(["admin","superadmin"]))):
+def update_role(
+    request: UpdateRoleRequest,
+    current_user=Depends(role_required(["admin","superadmin"]))
+):
     if request.new_role not in ["user", "admin", "superadmin"]:
         raise HTTPException(status_code=400, detail="Invalid role")
 
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
     try:
-        cursor.execute("UPDATE users SET role = %s WHERE username = %s RETURNING id", (request.new_role, request.username))
+        cursor.execute(
+            "UPDATE users SET role = %s WHERE username = %s RETURNING id",
+            (request.new_role, request.username)
+        )
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="User not found")
         connection.commit()
@@ -536,20 +626,25 @@ def get_all_users(current_user=Depends(role_required(["superadmin"]))):
     try:
         cursor.execute("SELECT id, username, role FROM users ORDER BY id ASC")
         result = cursor.fetchall()
-        users = []
-        for row in result:
-            users.append({"id": row[0], "username": row[1], "role": row[2]})
+        users = [{"id": row[0], "username": row[1], "role": row[2]} for row in result]
         return {"users": users}
     finally:
         cursor.close()
         connection.close()
 
 @app.post("/admin/users/{user_id}/change-username")
-def change_username(user_id: int, new_username: str = Form(...), current_user=Depends(role_required(["superadmin"]))):
+def change_username(
+    user_id: int,
+    new_username: str = Form(...),
+    current_user=Depends(role_required(["superadmin"]))
+):
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
     try:
-        cursor.execute("UPDATE users SET username = %s WHERE id = %s RETURNING id", (new_username, user_id))
+        cursor.execute(
+            "UPDATE users SET username = %s WHERE id = %s RETURNING id",
+            (new_username, user_id)
+        )
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="User not found")
         connection.commit()
@@ -559,12 +654,19 @@ def change_username(user_id: int, new_username: str = Form(...), current_user=De
         connection.close()
 
 @app.post("/admin/users/{user_id}/change-password")
-def change_password(user_id: int, new_password: str = Form(...), current_user=Depends(role_required(["superadmin"]))):
+def change_password(
+    user_id: int,
+    new_password: str = Form(...),
+    current_user=Depends(role_required(["superadmin"]))
+):
     hashed_password = hashlib.sha256(new_password.encode()).hexdigest()
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
     try:
-        cursor.execute("UPDATE users SET password = %s WHERE id = %s RETURNING id", (hashed_password, user_id))
+        cursor.execute(
+            "UPDATE users SET password = %s WHERE id = %s RETURNING id",
+            (hashed_password, user_id)
+        )
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="User not found")
         connection.commit()
@@ -574,7 +676,10 @@ def change_password(user_id: int, new_password: str = Form(...), current_user=De
         connection.close()
 
 @app.get("/admin/users/{user_id}/chats")
-def get_user_chats(user_id: int, current_user=Depends(role_required(["superadmin"]))):
+def get_user_chats(
+    user_id: int,
+    current_user=Depends(role_required(["superadmin"]))
+):
     connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
     try:
@@ -592,9 +697,11 @@ def get_user_chats(user_id: int, current_user=Depends(role_required(["superadmin
         cursor.close()
         connection.close()
 
-# New endpoint to trigger the embedding of documents from a given directory
 @app.post("/embed-documents")
-def embed_documents(directory: str = Form(...), current_user=Depends(role_required(["admin", "superadmin"]))):
+def embed_documents(
+    directory: str = Form(...),
+    current_user=Depends(role_required(["admin", "superadmin"]))
+):
     if not os.path.isdir(directory):
         raise HTTPException(status_code=400, detail="Invalid directory")
 
@@ -605,7 +712,10 @@ def embed_documents(directory: str = Form(...), current_user=Depends(role_requir
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/workspaces/{user_id}/list")
-def get_user_workspaces(user_id: int, current_user=Depends(role_required(["admin", "superadmin"]))):
+def get_user_workspaces(
+    user_id: int,
+    current_user=Depends(role_required(["admin", "superadmin"]))
+):
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
     try:
@@ -621,3 +731,17 @@ def get_user_workspaces(user_id: int, current_user=Depends(role_required(["admin
     finally:
         cursor.close()
         connection.close()
+
+@app.post("/configure-storage")
+def configure_storage(
+    storage_config: StorageConfig,
+    current_user=Depends(role_required(["superadmin"]))
+):
+    """
+    Configure the storage settings for the application.
+    """
+    config_path = "storage_config.json"
+    with open(config_path, "w") as f:
+        json.dump(storage_config.dict(), f)
+
+    return {"message": f"Storage configured successfully for {storage_config.datalake_type}"}
