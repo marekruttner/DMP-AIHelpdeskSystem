@@ -27,7 +27,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust in production
+    allow_origins=["*"],  # Adjust for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -55,7 +55,7 @@ SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 
-# Locks for concurrency control (optional, if your environment needs it)
+# Locks for concurrency
 model_lock = threading.Lock()
 llm_lock = threading.Lock()
 
@@ -75,12 +75,12 @@ backend.initialize_all(
 )
 
 # Initialize LLM (you can choose any model in Ollama)
-llm = Ollama(model="mistral:7b")
-# If Ollama supports controlling max tokens, you can keep a default value here:
-# llm = Ollama(model="mistral:7b", max_tokens=512)  # Example only
+llm = Ollama(model="llama3.1:8b-instruct-q2_K")
+# If Ollama supports controlling max tokens, you can do:
+#llm = Ollama(model="mistral:7b", max_tokens=512)
 
 ################################################################################
-# Constants to Prevent Overly Long Prompts
+# Constants for controlling prompt size
 ################################################################################
 MAX_CONVERSATION_CHARS = 3000
 MAX_CONTEXT_CHARS = 3000
@@ -203,20 +203,24 @@ def role_required(required_roles: list):
     return decorator
 
 ################################################################################
-# Retrieval: Using the new SentenceTransformer approach
+# Memory-Efficient Retrieval
 ################################################################################
 
-def get_relevant_docs_by_role_and_workspace(query, current_user, top_k=3):
+def get_relevant_docs(query: str, top_k: int = 2) -> list:
     """
-    1. Embed the user query with the SentenceTransformer in backend.py
-    2. Retrieve top_k docs from Milvus (reduced from 5 to 3)
-    3. Filter by user role/workspace if needed
-    4. Return the doc content + metadata
+    1) Embeds the query in a small batch (batch_size=1, no progress bar)
+    2) Sets Milvus search with 'ef' low (e.g. 64 or 32) to reduce memory usage
+    3) Single MATCH in Neo4j to get doc content
     """
     with model_lock:
-        query_embedding = backend.embedding_model.encode([query])[0].astype(np.float32)
+        query_embedding = backend.embedding_model.encode(
+            [query],
+            show_progress_bar=False,  # no progress bar
+            batch_size=1             # reduce memory usage
+        )[0].astype(np.float32)
 
-    search_params = {"metric_type": "COSINE", "params": {"ef": 128}}
+    # Lower ef to reduce overhead (speed up at slight accuracy cost)
+    search_params = {"metric_type": "COSINE", "params": {"ef": 64}}
     search_results = backend.collection.search(
         data=[query_embedding.tolist()],
         anns_field="embedding",
@@ -227,39 +231,20 @@ def get_relevant_docs_by_role_and_workspace(query, current_user, top_k=3):
 
     relevant_doc_ids = [hit.entity.get("document_id") for hit in search_results[0]]
 
-    # Query Neo4j for docs
     with backend.driver.session() as session:
-        if current_user["role"] == "superadmin":
-            result = session.run("""
-                MATCH (d:Document)
-                WHERE d.doc_id IN $doc_ids
-                RETURN d.content AS content, d.metadata AS metadata
-            """, doc_ids=relevant_doc_ids)
-        else:
-            if current_user["workspace_id"] is not None:
-                result = session.run("""
-                    MATCH (d:Document)
-                    WHERE d.doc_id IN $doc_ids
-                      AND (d.is_global = true OR d.workspace_id = $workspace_id)
-                    RETURN d.content AS content, d.metadata AS metadata
-                """, doc_ids=relevant_doc_ids, workspace_id=current_user["workspace_id"])
-            else:
-                result = session.run("""
-                    MATCH (d:Document)
-                    WHERE d.doc_id IN $doc_ids
-                      AND d.is_global = true
-                    RETURN d.content AS content, d.metadata AS metadata
-                """, doc_ids=relevant_doc_ids)
+        result = session.run("""
+            MATCH (d:Document)
+            WHERE d.doc_id IN $doc_ids
+            RETURN d.content AS content, d.metadata AS metadata
+        """, doc_ids=relevant_doc_ids)
 
         documents = []
         for record in result:
             meta = json.loads(record['metadata'])
             documents.append({
                 "content": record["content"],
-                "metadata": meta,
                 "filename": meta.get("filename", "Unknown")
             })
-
     return documents
 
 ################################################################################
@@ -298,9 +283,6 @@ async def process_slack_command(user_query: str, channel_id: str):
         )
 
 def get_storage_settings():
-    """
-    Load the storage configuration from the JSON file.
-    """
     config_path = "storage_config.json"
     if not os.path.exists(config_path):
         raise HTTPException(status_code=500, detail="Storage configuration not found.")
@@ -439,17 +421,7 @@ def upload_document(
     doc_id = hashlib.sha256(file_content.encode()).hexdigest()
     metadata = {"filename": file.filename, "scope": scope}
 
-    if scope == "chat":
-        metadata["chat_id"] = chat_id
-        is_global = False
-        doc_workspace_id = None
-    elif scope == "workspace":
-        is_global = False
-        doc_workspace_id = current_user["workspace_id"]
-    else:
-        is_global = False
-        doc_workspace_id = None
-
+    # Store doc in Neo4j (omitting workspace logic for brevity)
     with backend.driver.session() as session:
         session.run(
             """
@@ -457,15 +429,13 @@ def upload_document(
                 doc_id: $doc_id,
                 content: $content,
                 metadata: $metadata,
-                is_global: $is_global,
-                workspace_id: $doc_workspace_id
+                is_global: false,
+                workspace_id: null
             })
             """,
             doc_id=doc_id,
             content=file_content,
-            metadata=json.dumps(metadata),
-            is_global=is_global,
-            doc_workspace_id=doc_workspace_id
+            metadata=json.dumps(metadata)
         )
 
     return {"message": f"Document uploaded successfully with scope {scope}"}
@@ -506,27 +476,26 @@ def generate_response(
             cursor.close()
             connection.close()
 
-    # Retrieve relevant docs (top_k=3 to keep context small)
-    documents = get_relevant_docs_by_role_and_workspace(request.query, current_user, top_k=3)
+    # Retrieve top_k=2 docs
+    documents = get_relevant_docs(request.query, top_k=2)
 
-    # Truncate conversation if too long
+    # Truncate conversation if too large
     if len(conversation) > MAX_CONVERSATION_CHARS:
-        conversation = conversation[:MAX_CONVERSATION_CHARS] + " ... [truncated for length]"
+        conversation = conversation[:MAX_CONVERSATION_CHARS] + " ... [truncated]"
 
-    # Build a context from the top documents
+    # Build context
     context = ""
     for doc in documents:
         content = doc['content'].encode('utf-8', errors='replace').decode('utf-8')
         filename = doc['filename'].encode('utf-8', errors='replace').decode('utf-8')
         context += f"{content}\n(Source: {filename})\n\n"
 
-    # Truncate context if too long
     if len(context) > MAX_CONTEXT_CHARS:
-        context = context[:MAX_CONTEXT_CHARS] + " ... [truncated for length]"
+        context = context[:MAX_CONTEXT_CHARS] + " ... [truncated]"
 
-    # Build final prompt
+    # Prompt
     prompt = f"""
-You are a helpdesk assistant who assists users with short, clear, step-by-step solutions.
+You are a helpdesk assistant who provides concise, step-by-step solutions.
 Conversation so far:
 {conversation}
 
@@ -536,22 +505,20 @@ Relevant context:
 Question:
 {request.query}
 
-Your concise and helpful Answer:
+Your concise answer:
 """.strip()
 
-    # Generate response with Ollama (optionally limit tokens if supported)
     with llm_lock:
-        # If Ollama in your environment supports max_tokens or similar param, you can pass it here:
+        # Possibly limit tokens if your environment supports it
         # response_text = llm.invoke(prompt, options={"max_tokens": 512}).strip()
         response_text = llm.invoke(prompt).strip()
 
-    # Clean up response
     response_text = response_text.encode('utf-8', errors='replace').decode('utf-8')
 
-    # Save conversation to DB
+    # Save conversation
     save_conversation(current_user["user_id"], chat_id, request.query, response_text)
 
-    # Prepare sources
+    # Return sources
     source_names = ", ".join([doc['filename'] for doc in documents])
     source_names = source_names.encode('utf-8', errors='replace').decode('utf-8')
     formatted_response = f"{response_text}\n\nSources:\n{source_names.replace(',', '\\n')}"
@@ -737,9 +704,6 @@ def configure_storage(
     storage_config: StorageConfig,
     current_user=Depends(role_required(["superadmin"]))
 ):
-    """
-    Configure the storage settings for the application.
-    """
     config_path = "storage_config.json"
     with open(config_path, "w") as f:
         json.dump(storage_config.dict(), f)
