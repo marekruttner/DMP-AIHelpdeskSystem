@@ -17,6 +17,7 @@ class _ChatScreenState extends State<ChatScreen> {
   List<Map<String, dynamic>> chats = [];
   String? currentChatId;
   String? currentChatName;
+  bool isTyping = false; // Track typing status
 
   @override
   void initState() {
@@ -102,6 +103,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
     setState(() {
       messages.add({"message": userMessage, "isUser": true});
+      isTyping = true; // Show typing indicator
     });
 
     messageController.clear();
@@ -124,12 +126,14 @@ class _ChatScreenState extends State<ChatScreen> {
 
       setState(() {
         messages.add({"message": botMessage, "isUser": false});
+        isTyping = false; // Hide typing indicator
       });
 
       _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
     } catch (e) {
       setState(() {
         messages.add({"message": "Failed to send message", "isUser": false});
+        isTyping = false; // Hide typing indicator on error
       });
     }
   }
@@ -211,8 +215,12 @@ class _ChatScreenState extends State<ChatScreen> {
           Expanded(
             child: ListView.builder(
               controller: _scrollController,
-              itemCount: messages.length,
+              itemCount: messages.length + (isTyping ? 1 : 0),
               itemBuilder: (context, index) {
+                if (isTyping && index == messages.length) {
+                  return TypingIndicator(); // Show typing indicator at the end
+                }
+
                 final chat = messages[index];
                 return ChatBubble(
                   message: chat['message'],
@@ -281,5 +289,68 @@ class ChatBubble extends StatelessWidget {
         ),
       ),
     );
+  }
+}
+
+class TypingIndicator extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Container(
+        margin: EdgeInsets.symmetric(vertical: 5, horizontal: 10),
+        padding: EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: Colors.grey[200],
+          borderRadius: BorderRadius.circular(15),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            DotAnimation(),
+            SizedBox(width: 5),
+            Text("AI is typing...", style: TextStyle(fontSize: 14, color: Colors.grey[700])),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class DotAnimation extends StatefulWidget {
+  @override
+  _DotAnimationState createState() => _DotAnimationState();
+}
+
+class _DotAnimationState extends State<DotAnimation> with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+  late Animation<int> _dotCountAnimation;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      duration: Duration(seconds: 1),
+      vsync: this,
+    )..repeat();
+
+    _dotCountAnimation = StepTween(begin: 1, end: 3).animate(_controller);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _dotCountAnimation,
+      builder: (context, child) {
+        String dots = "." * _dotCountAnimation.value;
+        return Text(dots, style: TextStyle(fontSize: 18));
+      },
+    );
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
   }
 }

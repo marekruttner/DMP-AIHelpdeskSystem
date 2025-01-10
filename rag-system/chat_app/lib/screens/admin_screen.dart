@@ -20,6 +20,8 @@ class _AdminScreenState extends State<AdminScreen> {
   final TextEditingController embedDirectoryController = TextEditingController();
   final TextEditingController newUsernameController = TextEditingController();
   final TextEditingController newPasswordController = TextEditingController();
+  // New controller for specifying workspace ID when embedding (if not global)
+  final TextEditingController embedWorkspaceIdController = TextEditingController();
 
   // Variables
   String selectedRole = "user";
@@ -28,6 +30,9 @@ class _AdminScreenState extends State<AdminScreen> {
   List<dynamic> allUsers = [];
   Map<int, List<dynamic>> userWorkspacesMap = {};
   Map<int, List<dynamic>> userChatsMap = {};
+
+  // New variable to toggle Global vs. Workspace
+  bool isGlobalSelected = true;
 
   @override
   void initState() {
@@ -175,8 +180,20 @@ class _AdminScreenState extends State<AdminScreen> {
       });
       return;
     }
+
     try {
-      await apiService.embedDocuments(directory);
+      int? workspaceId;
+      if (!isGlobalSelected && embedWorkspaceIdController.text.isNotEmpty) {
+        workspaceId = int.parse(embedWorkspaceIdController.text.trim());
+      }
+
+      // Call the updated apiService method
+      await apiService.embedDocuments(
+        directory: directory,
+        isGlobal: isGlobalSelected,
+        workspaceId: workspaceId,
+      );
+
       setState(() {
         statusMessage = "Documents embedded successfully from $directory.";
       });
@@ -209,7 +226,10 @@ class _AdminScreenState extends State<AdminScreen> {
             if (statusMessage.isNotEmpty)
               Padding(
                 padding: const EdgeInsets.only(bottom: 20),
-                child: Text(statusMessage, style: TextStyle(fontSize: 16, color: Colors.blue)),
+                child: Text(
+                  statusMessage,
+                  style: TextStyle(fontSize: 16, color: Colors.blue),
+                ),
               ),
             // Workspace Management
             Card(
@@ -288,26 +308,30 @@ class _AdminScreenState extends State<AdminScreen> {
                                     ElevatedButton(
                                       onPressed: () {
                                         showDialog(
-                                            context: context,
-                                            builder: (context) {
-                                              return AlertDialog(
-                                                title: Text("Change Username"),
-                                                content: TextField(
-                                                  controller: newUsernameController,
-                                                  decoration: InputDecoration(labelText: "New Username"),
+                                          context: context,
+                                          builder: (context) {
+                                            return AlertDialog(
+                                              title: Text("Change Username"),
+                                              content: TextField(
+                                                controller: newUsernameController,
+                                                decoration: InputDecoration(labelText: "New Username"),
+                                              ),
+                                              actions: [
+                                                TextButton(
+                                                  onPressed: () => Navigator.pop(context),
+                                                  child: Text("Cancel"),
                                                 ),
-                                                actions: [
-                                                  TextButton(onPressed: () => Navigator.pop(context), child: Text("Cancel")),
-                                                  ElevatedButton(
-                                                    onPressed: () {
-                                                      Navigator.pop(context);
-                                                      changeUsername(user['id']);
-                                                    },
-                                                    child: Text("Change"),
-                                                  )
-                                                ],
-                                              );
-                                            });
+                                                ElevatedButton(
+                                                  onPressed: () {
+                                                    Navigator.pop(context);
+                                                    changeUsername(user['id']);
+                                                  },
+                                                  child: Text("Change"),
+                                                )
+                                              ],
+                                            );
+                                          },
+                                        );
                                       },
                                       style: ElevatedButton.styleFrom(backgroundColor: Colors.blue),
                                       child: Text("Change Username"),
@@ -316,27 +340,31 @@ class _AdminScreenState extends State<AdminScreen> {
                                     ElevatedButton(
                                       onPressed: () {
                                         showDialog(
-                                            context: context,
-                                            builder: (context) {
-                                              return AlertDialog(
-                                                title: Text("Change Password"),
-                                                content: TextField(
-                                                  controller: newPasswordController,
-                                                  decoration: InputDecoration(labelText: "New Password"),
-                                                  obscureText: true,
+                                          context: context,
+                                          builder: (context) {
+                                            return AlertDialog(
+                                              title: Text("Change Password"),
+                                              content: TextField(
+                                                controller: newPasswordController,
+                                                decoration: InputDecoration(labelText: "New Password"),
+                                                obscureText: true,
+                                              ),
+                                              actions: [
+                                                TextButton(
+                                                  onPressed: () => Navigator.pop(context),
+                                                  child: Text("Cancel"),
                                                 ),
-                                                actions: [
-                                                  TextButton(onPressed: () => Navigator.pop(context), child: Text("Cancel")),
-                                                  ElevatedButton(
-                                                    onPressed: () {
-                                                      Navigator.pop(context);
-                                                      changePassword(user['id']);
-                                                    },
-                                                    child: Text("Change"),
-                                                  )
-                                                ],
-                                              );
-                                            });
+                                                ElevatedButton(
+                                                  onPressed: () {
+                                                    Navigator.pop(context);
+                                                    changePassword(user['id']);
+                                                  },
+                                                  child: Text("Change"),
+                                                )
+                                              ],
+                                            );
+                                          },
+                                        );
                                       },
                                       style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
                                       child: Text("Change Password"),
@@ -390,6 +418,36 @@ class _AdminScreenState extends State<AdminScreen> {
                         ),
                       ),
                       SizedBox(height: 10),
+
+                      // Toggle for Global vs Workspace
+                      Row(
+                        children: [
+                          Text("Global? "),
+                          Switch(
+                            value: isGlobalSelected,
+                            onChanged: (newValue) {
+                              setState(() {
+                                isGlobalSelected = newValue;
+                                if (isGlobalSelected) {
+                                  embedWorkspaceIdController.clear();
+                                }
+                              });
+                            },
+                          ),
+                        ],
+                      ),
+                      if (!isGlobalSelected) ...[
+                        TextField(
+                          controller: embedWorkspaceIdController,
+                          keyboardType: TextInputType.number,
+                          decoration: InputDecoration(
+                            labelText: "Workspace ID",
+                            border: OutlineInputBorder(),
+                          ),
+                        ),
+                        SizedBox(height: 10),
+                      ],
+
                       ElevatedButton(
                         onPressed: embedDocuments,
                         style: ElevatedButton.styleFrom(backgroundColor: Colors.pink),

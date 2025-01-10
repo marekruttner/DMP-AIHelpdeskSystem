@@ -104,24 +104,37 @@ def store_embeddings(doc_ids, embeddings):
     collection.insert([doc_ids, embeddings.tolist()])
     collection.flush()
 
-def _create_document_node_tx(tx, doc_id, content, metadata_json):
+def _create_document_node_tx(tx, doc_id, content, metadata_json, is_global, workspace_id):
     tx.run("""
         CREATE (d:Document {
             doc_id: $doc_id,
             content: $content,
             metadata: $metadata_json,
-            is_global: true,
-            workspace_id: null
+            is_global: $is_global,
+            workspace_id: $workspace_id
         })
-    """, doc_id=doc_id, content=content, metadata_json=metadata_json)
-
-def create_document_node(doc_id, content, metadata):
+    """,
+        doc_id=doc_id,
+        content=content,
+        metadata_json=metadata_json,
+        is_global=is_global,
+        workspace_id=workspace_id
+    )
+def create_document_node(doc_id, content, metadata, is_global=True, workspace_id=None):
     """
-    Create a document node in Neo4j using a write transaction.
+    Create a document node in Neo4j using a write transaction,
+    optionally assigning it to a workspace or making it global.
     """
     metadata_json = json.dumps(metadata)
     with driver.session() as session:
-        session.write_transaction(_create_document_node_tx, doc_id, content, metadata_json)
+        session.write_transaction(
+            _create_document_node_tx,
+            doc_id,
+            content,
+            metadata_json,
+            is_global,
+            workspace_id
+        )
 
 def _create_relationship_tx(tx, doc_id_1, doc_id_2, relationship_type, extra_data):
     tx.run("""
@@ -205,7 +218,7 @@ def extract_metadata(file_path, content):
         metadata["type"] = "Text"
     return metadata
 
-def process_batch(docs_batch, directory):
+def process_batch(docs_batch, is_global=True, workspace_id=None):
     """
     Process a batch of documents, create nodes, embeddings, and relationships.
     Each write operation is done in its own transaction to reduce memory usage.
@@ -214,14 +227,19 @@ def process_batch(docs_batch, directory):
     doc_ids = []
     doc_map = {}
 
-    # Insert documents and compute embeddings
     for (filename, doc_id, content, metadata) in docs_batch:
         links, _ = extract_links_and_references(content, doc_map)
         metadata["links"] = [link.split("/")[-1] for link in links]
         doc_map[filename] = doc_id
 
-        # Create document node
-        create_document_node(doc_id, content, metadata)
+        # Create document node with workspace info
+        create_document_node(
+            doc_id,
+            content,
+            metadata,
+            is_global=is_global,
+            workspace_id=workspace_id
+        )
 
         # Generate embedding
         inputs = tokenizer(content, return_tensors="pt", truncation=True, padding=True, max_length=128)
@@ -244,15 +262,21 @@ def process_batch(docs_batch, directory):
         for target_doc_id, _ in relationships:
             create_relationship(doc_id, target_doc_id, "LINK", extra_data={"source": filename})
 
-def process_documents(directory, batch_size=50):
+def process_documents(
+    directory,
+    is_global=True,
+    workspace_id=None,
+    batch_size=50,
+    clear_graph_first=True
+):
     """
     Process and embed documents from a directory in batches,
-    store them in Milvus and Neo4j, and compute relationships.
+    optionally clearing the existing graph first.
+    If is_global=False, the documents belong to workspace_id.
     """
-    # Clear the Neo4j graph in batches to prevent memory issues
-    clear_neo4j_graph()
+    if clear_graph_first:
+        clear_neo4j_graph()
 
-    # Collect all documents first
     docs = []
     for filename in os.listdir(directory):
         file_path = os.path.join(directory, filename)
@@ -262,10 +286,9 @@ def process_documents(directory, batch_size=50):
             metadata = extract_metadata(file_path, content)
             docs.append((filename, doc_id, content, metadata))
 
-    # Process in batches
     for i in range(0, len(docs), batch_size):
-        batch = docs[i:i+batch_size]
-        process_batch(batch, directory)
+        batch = docs[i:i + batch_size]
+        process_batch(batch, is_global=is_global, workspace_id=workspace_id)
 
 def initialize_all(neo4j_uri="bolt://localhost:7687", neo4j_user="neo4j", neo4j_password="testtest", milvus_host="localhost", milvus_port="19530"):
     init_milvus_collection(host=milvus_host, port=milvus_port, collection_name="document_embeddings")

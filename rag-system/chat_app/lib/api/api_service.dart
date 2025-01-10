@@ -251,14 +251,31 @@ class ApiService {
     }
   }
 
-  Future<void> embedDocuments(String directory) async {
+  Future<void> embedDocuments({
+    required String directory,
+    required bool isGlobal,
+    int? workspaceId,
+  }) async {
+    // We'll send form-urlencoded data
+    final uri = Uri.parse('$baseUrl/embed-documents');
+
+    // Build the fields
+    final Map<String, String> fields = {
+      'directory': directory,
+      'is_global': isGlobal.toString(),
+      // Only send workspace_id if not global and we have a valid ID
+    };
+    if (!isGlobal && workspaceId != null) {
+      fields['workspace_id'] = workspaceId.toString();
+    }
+
     final response = await http.post(
-      Uri.parse('$baseUrl/embed-documents'),
+      uri,
       headers: {
         ...authHeaders,
         'Content-Type': 'application/x-www-form-urlencoded'
       },
-      body: 'directory=${Uri.encodeQueryComponent(directory)}',
+      body: fields,
     );
 
     if (response.statusCode != 200) {
