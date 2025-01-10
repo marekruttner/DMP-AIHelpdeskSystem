@@ -20,6 +20,7 @@ dependencies:
   uuid: ^4.4.2
   flutter_markdown: ^0.6.10
   file_picker: ^5.0.0
+  jwt_decoder: ^2.0.1
 
 dev_dependencies:
   flutter_test:

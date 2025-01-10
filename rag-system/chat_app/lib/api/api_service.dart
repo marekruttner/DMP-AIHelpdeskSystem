@@ -68,6 +68,19 @@ class ApiService {
     }
   }
 
+  Future<int> getCurrentUserId() async {
+    final response = await http.get(
+      Uri.parse('$baseUrl/me'),
+      headers: authHeaders,
+    );
+    if (response.statusCode == 200) {
+      final data = json.decode(utf8.decode(response.bodyBytes));
+      return data["user_id"];
+    } else {
+      throw Exception("Failed to fetch user ID. Status: ${response.statusCode}");
+    }
+  }
+
   Future<List<dynamic>> getChats() async {
     final response = await http.get(Uri.parse('$baseUrl/chats'), headers: authHeaders);
     if (response.statusCode == 200) {
@@ -87,9 +100,27 @@ class ApiService {
     }
   }
 
-  Future<Map<String, dynamic>> chat(String query, {required bool newChat, String? chatId}) async {
-    final body = {'query': query, 'new_chat': newChat};
-    if (chatId != null) body['chat_id'] = chatId;
+  /// Updated to include the excludeGlobal field in the JSON body
+  Future<Map<String, dynamic>> chat(
+      String query, {
+        required bool newChat,
+        String? chatId,
+        List<int>? workspaceIds,
+        required bool excludeGlobal,
+      }) async {
+    final body = {
+      'query': query,
+      'new_chat': newChat,
+      // Send exclude_global to the backend
+      'exclude_global': excludeGlobal,
+    };
+
+    if (chatId != null) {
+      body['chat_id'] = chatId;
+    }
+    if (workspaceIds != null && workspaceIds.isNotEmpty) {
+      body['workspace_ids'] = workspaceIds;
+    }
 
     final response = await http.post(
       Uri.parse('$baseUrl/chat'),
@@ -103,7 +134,8 @@ class ApiService {
     if (response.statusCode == 200) {
       return json.decode(utf8.decode(response.bodyBytes));
     } else {
-      throw Exception('Failed to send chat message');
+      final errorData = json.decode(utf8.decode(response.bodyBytes));
+      throw Exception(errorData['detail'] ?? 'Failed to send chat message');
     }
   }
 
@@ -259,11 +291,9 @@ class ApiService {
     // We'll send form-urlencoded data
     final uri = Uri.parse('$baseUrl/embed-documents');
 
-    // Build the fields
     final Map<String, String> fields = {
       'directory': directory,
       'is_global': isGlobal.toString(),
-      // Only send workspace_id if not global and we have a valid ID
     };
     if (!isGlobal && workspaceId != null) {
       fields['workspace_id'] = workspaceId.toString();

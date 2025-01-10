@@ -276,92 +276,65 @@ def get_relevant_docs_by_role_and_workspace(
     )
     relevant_doc_ids = [hit.entity.get("document_id") for hit in search_results[0]]
 
+    # Convert to set for logging
+    # print(f"Relevant doc_ids from Milvus: {relevant_doc_ids}")
+
     with backend.driver.session() as session:
         user_role = current_user["role"]
         user_ws_ids = set(current_user["workspace_ids"])  # The array from DB
 
-        # If superadmin
-        if user_role == "superadmin":
-            if workspace_ids and len(workspace_ids) > 0:
-                if exclude_global:
-                    cypher = """
-                        MATCH (d:Document)
-                        WHERE d.doc_id IN $doc_ids
-                          AND d.is_global = false
-                          AND d.workspace_id IN $workspace_ids
-                        RETURN d.content AS content, d.metadata AS metadata
-                    """
-                else:
-                    cypher = """
-                        MATCH (d:Document)
-                        WHERE d.doc_id IN $doc_ids
-                          AND (
-                            d.is_global = true
-                            OR d.workspace_id IN $workspace_ids
-                          )
-                        RETURN d.content AS content, d.metadata AS metadata
-                    """
-                result = session.run(cypher, doc_ids=relevant_doc_ids, workspace_ids=workspace_ids)
-            else:
-                # No workspace filter
-                if exclude_global:
-                    cypher = """
-                        MATCH (d:Document)
-                        WHERE d.doc_id IN $doc_ids
-                          AND d.is_global = false
-                        RETURN d.content AS content, d.metadata AS metadata
-                    """
-                else:
-                    cypher = """
-                        MATCH (d:Document)
-                        WHERE d.doc_id IN $doc_ids
-                        RETURN d.content AS content, d.metadata AS metadata
-                    """
-                result = session.run(cypher, doc_ids=relevant_doc_ids)
+        # By default, we build a Cypher condition in parts
+        where_clauses = ["d.doc_id IN $doc_ids"]  # always restrict to top hits from Milvus
 
+        # if exclude_global => add "d.is_global = false"
+        if exclude_global:
+            where_clauses.append("d.is_global = false")
+
+        # if user is superadmin
+        if user_role == "superadmin":
+            # if workspace_ids is not empty => also match d.workspace_id IN workspace_ids
+            if workspace_ids and len(workspace_ids) > 0:
+                where_clauses.append("(d.workspace_id IN $workspace_ids OR d.is_global = true)")
+                # But note we also have `exclude_global` above,
+                # which effectively kills "d.is_global=true" if exclude_global is True.
+
+                # So final condition might be e.g.:
+                # d.doc_id IN $doc_ids AND d.is_global=false AND (d.workspace_id IN $workspace_ids OR d.is_global=true)
+                # The "is_global=false" part will override the OR is_global=true if exclude_global is True.
+            else:
+                # No workspace filter => superadmin can see all
+                where_clauses.append("(d.is_global = true OR d.workspace_id IS NOT NULL)")
+                # or any condition that suits your logic
         else:
-            # Non-superadmin => see only global or assigned workspaces
+            # Non-superadmin => see global OR user’s workspace
+            # But if workspace_ids is provided => user might want a smaller subset
             if workspace_ids and len(workspace_ids) > 0:
                 requested_ws = set(workspace_ids)
                 actual_ws_ids = list(requested_ws.intersection(user_ws_ids))
             else:
-                # If none requested, use all assigned
                 actual_ws_ids = list(user_ws_ids)
 
-            if exclude_global:
-                if len(actual_ws_ids) > 0:
-                    cypher = """
-                        MATCH (d:Document)
-                        WHERE d.doc_id IN $doc_ids
-                          AND d.is_global = false
-                          AND d.workspace_id IN $workspace_ids
-                        RETURN d.content AS content, d.metadata AS metadata
-                    """
-                    result = session.run(cypher, doc_ids=relevant_doc_ids, workspace_ids=actual_ws_ids)
-                else:
-                    result = []
+            if len(actual_ws_ids) > 0:
+                where_clauses.append("(d.is_global = true OR d.workspace_id IN $workspace_ids)")
             else:
-                # include global or user’s assigned
-                if len(actual_ws_ids) > 0:
-                    cypher = """
-                        MATCH (d:Document)
-                        WHERE d.doc_id IN $doc_ids
-                          AND (
-                            d.is_global = true
-                            OR d.workspace_id IN $workspace_ids
-                          )
-                        RETURN d.content AS content, d.metadata AS metadata
-                    """
-                    result = session.run(cypher, doc_ids=relevant_doc_ids, workspace_ids=actual_ws_ids)
-                else:
-                    # user has no workspace => only global
-                    cypher = """
-                        MATCH (d:Document)
-                        WHERE d.doc_id IN $doc_ids
-                          AND d.is_global = true
-                        RETURN d.content AS content, d.metadata AS metadata
-                    """
-                    result = session.run(cypher, doc_ids=relevant_doc_ids)
+                # user has no workspace => only global docs
+                where_clauses.append("d.is_global = true")
+
+        # Combine them with AND
+        final_where = " AND ".join(where_clauses)
+
+        cypher = f"""
+            MATCH (d:Document)
+            WHERE {final_where}
+            RETURN d.content AS content, d.metadata AS metadata
+        """
+
+        # print("Generated Cypher:", cypher)
+        result = session.run(
+            cypher,
+            doc_ids=relevant_doc_ids,
+            workspace_ids=workspace_ids if workspace_ids else list(user_ws_ids)
+        )
 
         documents = []
         if result:
@@ -373,7 +346,7 @@ def get_relevant_docs_by_role_and_workspace(
                     "filename": metadata.get("filename", "Unknown")
                 })
 
-    return documents
+        return documents
 
 
 # -------------------------------------------
@@ -887,6 +860,11 @@ def embed_documents(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/me")
+def who_am_i(current_user=Depends(get_current_user_with_role)):
+    # This depends on your "get_current_user_with_role" returning
+    # a dict with "user_id". If that's the case, just:
+    return {"user_id": current_user["user_id"]}
 
 @app.get("/workspaces/{user_id}/list")
 def get_user_workspaces(
