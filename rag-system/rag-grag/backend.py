@@ -216,7 +216,10 @@ def create_document_node(doc_id, content, metadata):
 def _create_relationship_tx(tx, doc_id_1, doc_id_2, relationship_type, extra_data):
     tx.run(
         """
-        MATCH (d1:Document {doc_id: $doc_id_1}), (d2:Document {doc_id: $doc_id_2})
+        MATCH (d1:Document {doc_id: $doc_id_1})
+        WITH d1
+        MATCH (d2:Document {doc_id: $doc_id_2})
+        WHERE d1 <> d2
         CREATE (d1)-[:RELATED {type: $relationship_type, extra: $extra_data}]->(d2)
         """,
         doc_id_1=doc_id_1,

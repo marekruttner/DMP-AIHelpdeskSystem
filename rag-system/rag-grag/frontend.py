@@ -18,6 +18,7 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 import hmac
 import threading
+from dotenv import load_dotenv
 
 # Import the backend module
 import backend
@@ -32,6 +33,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+load_dotenv()
 
 # PostgreSQL connection
 DB_CONFIG = {
@@ -76,8 +79,6 @@ backend.initialize_all(
 
 # Initialize LLM (you can choose any model in Ollama)
 llm = Ollama(model="llama3.1:8b-instruct-q2_K")
-# If Ollama supports controlling max tokens, you can do:
-#llm = Ollama(model="mistral:7b", max_tokens=512)
 
 ################################################################################
 # Constants for controlling prompt size
@@ -203,14 +204,37 @@ def role_required(required_roles: list):
     return decorator
 
 ################################################################################
+# NEW: Query Refinement Function
+################################################################################
+
+def refine_query(original_query: str) -> str:
+    """
+    Use the LLM to produce a more detailed or structured query
+    that might retrieve more relevant documents from the knowledge base.
+    """
+    prompt_for_refinement = f"""
+Your task is to rewrite the user's query below in a way that will retrieve
+the most relevant documents from a knowledge base or knowledge graph.
+Ensure you expand or clarify the query if needed, without losing the core meaning.
+
+User query: {original_query}
+
+Refined query:
+""".strip()
+
+    with llm_lock:
+        refined_query = llm.invoke(prompt_for_refinement).strip()
+    return refined_query
+
+################################################################################
 # Memory-Efficient Retrieval
 ################################################################################
 
 def get_relevant_docs(query: str, top_k: int = 2) -> list:
     """
     1) Embeds the query in a small batch (batch_size=1, no progress bar)
-    2) Sets Milvus search with 'ef' low (e.g. 64 or 32) to reduce memory usage
-    3) Single MATCH in Neo4j to get doc content
+    2) Uses Milvus search to retrieve top_k documents
+    3) Looks up doc content in Neo4j
     """
     with model_lock:
         query_embedding = backend.embedding_model.encode(
@@ -335,6 +359,7 @@ def get_chat_history(chat_id: str, current_user_id: int = Depends(get_current_us
 @app.post("/register")
 def register_user(username: str = Form(...), password: str = Form(...)):
     hashed_password = hashlib.sha256(password.encode()).hexdigest()
+    print("DB_CONFIG:", DB_CONFIG)
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
     try:
@@ -476,8 +501,14 @@ def generate_response(
             cursor.close()
             connection.close()
 
-    # Retrieve top_k=2 docs
-    documents = get_relevant_docs(request.query, top_k=2)
+    # --------------------------------------------------------------------------
+    # 1) REFINE the user query using LLM before searching RAG/Knowledge Graph
+    # --------------------------------------------------------------------------
+    refined_query = refine_query(request.query)
+    print(f"Refined query: {refined_query}")
+
+    # Retrieve top_k=2 docs using the refined query
+    documents = get_relevant_docs(refined_query, top_k=2)
 
     # Truncate conversation if too large
     if len(conversation) > MAX_CONVERSATION_CHARS:
@@ -502,8 +533,11 @@ Conversation so far:
 Relevant context:
 {context}
 
-Question:
+Original user question:
 {request.query}
+
+Refined query used for search:
+{refined_query}
 
 Your concise answer:
 """.strip()
@@ -515,7 +549,7 @@ Your concise answer:
 
     response_text = response_text.encode('utf-8', errors='replace').decode('utf-8')
 
-    # Save conversation
+    # Save conversation (we store the original user query, not the refined one)
     save_conversation(current_user["user_id"], chat_id, request.query, response_text)
 
     # Return sources
