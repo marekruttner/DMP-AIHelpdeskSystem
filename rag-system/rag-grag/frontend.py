@@ -78,7 +78,7 @@ backend.initialize_all(
 )
 
 # Initialize LLM (you can choose any model in Ollama)
-llm = Ollama(model="llama3.1:8b-instruct-q2_K")
+llm = Ollama(model="llama3.1:8b")
 
 ################################################################################
 # Constants for controlling prompt size
@@ -207,24 +207,30 @@ def role_required(required_roles: list):
 # NEW: Query Refinement Function
 ################################################################################
 
-def refine_query(original_query: str) -> str:
+def refine_query(original_query: str, conversation_context: str) -> str:
     """
-    Use the LLM to produce a more detailed or structured query
-    that might retrieve more relevant documents from the knowledge base.
+    Use the LLM to produce a short, direct refined query in the same language
+    as the user. The refined query should incorporate any relevant context
+    from the conversation so far, but must not contain meta commentary.
     """
     prompt_for_refinement = f"""
-Your task is to rewrite the user's query below in a way that will retrieve
-the most relevant documents from a knowledge base or knowledge graph.
-Ensure you expand or clarify the query if needed, without losing the core meaning.
-
-User query: {original_query}
-
-Refined query:
-""".strip()
+        You are a query refiner. Given the conversation so far and the user's latest query,
+        rewrite the latest query into a short, direct query that will best match relevant documents
+        in a Czech knowledge base. If the conversation is in Czech, keep it in Czech; if in English,
+        keep it in English. Avoid any extra explanation or commentary. Simply return the refined query.
+        
+        Conversation so far:
+        {conversation_context}
+        
+        User's latest query: {original_query}
+        
+        Refined query (no additional text, just the query):
+        """.strip()
 
     with llm_lock:
         refined_query = llm.invoke(prompt_for_refinement).strip()
     return refined_query
+
 
 ################################################################################
 # Memory-Efficient Retrieval
@@ -472,6 +478,9 @@ def generate_response(
 ):
     print(f"Request received: {request.dict()}")
 
+    # ---------------------------------------------
+    # 1) Get or create the chat_id and conversation
+    # ---------------------------------------------
     if request.new_chat:
         chat_id = str(uuid.uuid4())
         conversation = ""
@@ -494,6 +503,7 @@ def generate_response(
                 (current_user["user_id"], chat_id)
             )
             result = cursor.fetchall()
+            # Join all conversation entries
             conversation = "\n".join([record[0] for record in result])
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error fetching chat history: {e}")
@@ -501,60 +511,57 @@ def generate_response(
             cursor.close()
             connection.close()
 
-    # --------------------------------------------------------------------------
-    # 1) REFINE the user query using LLM before searching RAG/Knowledge Graph
-    # --------------------------------------------------------------------------
-    refined_query = refine_query(request.query)
+    # ---------------------------------------------
+    # 2) Refine the user's current query with LLM
+    # ---------------------------------------------
+    refined_query = refine_query(request.query, conversation)
     print(f"Refined query: {refined_query}")
 
-    # Retrieve top_k=2 docs using the refined query
+    # ---------------------------------------------
+    # 3) Retrieve relevant docs based on refined query
+    # ---------------------------------------------
     documents = get_relevant_docs(refined_query, top_k=2)
 
-    # Truncate conversation if too large
+    # If conversation is too large, truncate
     if len(conversation) > MAX_CONVERSATION_CHARS:
         conversation = conversation[:MAX_CONVERSATION_CHARS] + " ... [truncated]"
 
-    # Build context
+    # Build context from docs (also truncated if too large)
     context = ""
     for doc in documents:
         content = doc['content'].encode('utf-8', errors='replace').decode('utf-8')
         filename = doc['filename'].encode('utf-8', errors='replace').decode('utf-8')
         context += f"{content}\n(Source: {filename})\n\n"
-
     if len(context) > MAX_CONTEXT_CHARS:
         context = context[:MAX_CONTEXT_CHARS] + " ... [truncated]"
 
-    # Prompt
+    # ---------------------------------------------
+    # 4) Construct the final prompt and call the LLM
+    # ---------------------------------------------
     prompt = f"""
-You are a helpdesk assistant who provides concise, step-by-step solutions.
-Conversation so far:
-{conversation}
-
-Relevant context:
-{context}
-
-Original user question:
-{request.query}
-
-Refined query used for search:
-{refined_query}
-
-Your concise answer:
-""".strip()
+        You are a helpdesk assistant who provides concise, step-by-step solutions.
+        Conversation so far:
+        {conversation}
+        
+        Relevant context:
+        {context}
+        
+        Question:
+        {request.query}
+        
+        Your concise answer:
+        """.strip()
 
     with llm_lock:
-        # Possibly limit tokens if your environment supports it
-        # response_text = llm.invoke(prompt, options={"max_tokens": 512}).strip()
         response_text = llm.invoke(prompt).strip()
-
     response_text = response_text.encode('utf-8', errors='replace').decode('utf-8')
 
-    # Save conversation (we store the original user query, not the refined one)
+    # ---------------------------------------------
+    # 5) Save conversation and return response
+    # ---------------------------------------------
     save_conversation(current_user["user_id"], chat_id, request.query, response_text)
 
-    # Return sources
     source_names = ", ".join([doc['filename'] for doc in documents])
-    source_names = source_names.encode('utf-8', errors='replace').decode('utf-8')
     formatted_response = f"{response_text}\n\nSources:\n{source_names.replace(',', '\\n')}"
 
     return {

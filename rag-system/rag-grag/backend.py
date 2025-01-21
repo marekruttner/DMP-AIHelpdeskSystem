@@ -142,7 +142,7 @@ def init_neo4j(
     driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
     logger.info(f"Connected to Neo4j at {neo4j_uri}")
 
-def init_embedding_model(model_name="sentence-transformers/all-MiniLM-L6-v2"):
+def init_embedding_model(model_name="intfloat/e5-large-v2"):
     """
     Initializes a Sentence-BERT or similar model from the sentence-transformers library.
     """
