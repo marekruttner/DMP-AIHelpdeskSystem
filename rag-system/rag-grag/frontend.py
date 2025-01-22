@@ -398,8 +398,7 @@ def hybrid_search(query: str, top_k: int = 5) -> list:
 def generate_cypher_query(refined_query: str) -> str:
     """
     Use LLM to generate a possible Cypher query to find relevant docs in the graph
-    based on topics, entities, or relationships. This is optional and might not
-    always produce valid Cypher.
+    ...
     """
     prompt = f"""
     You are a Cypher query generator. The user (in the knowledge base) asked a refined query:
@@ -407,15 +406,16 @@ def generate_cypher_query(refined_query: str) -> str:
 
     We have a Neo4j graph with :Document, :Topic, :Entity, and relationships like:
     (Document)-[:HAS_TOPIC]->(Topic), (Document)-[:MENTIONS]->(Entity),
-    (Document)-[:RELATED {type: 'SIMILAR_TO', ...}]->(Document).
+    (Document)-[:RELATED {{type: 'SIMILAR_TO', ...}}]->(Document).
 
     Generate a short Cypher query that tries to find Document nodes relevant to the user query.
-    Only output the Cypher. 
+    Only output the Cypher.
     """.strip()
 
     with llm_lock:
         possible_cypher = llm.invoke(prompt).strip()
     return possible_cypher
+
 
 
 def run_cypher_query(query_text: str, top_k: int = 5) -> list:
