@@ -99,7 +99,7 @@ def init_milvus_collection(
             FieldSchema(
                 name="embedding",
                 dtype=DataType.FLOAT_VECTOR,
-                dim=384
+                dim=1024
             ),
         ]
         schema = CollectionSchema(fields, description="Document Embeddings")

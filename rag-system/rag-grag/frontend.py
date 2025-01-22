@@ -217,7 +217,7 @@ def refine_query(original_query: str, conversation_context: str) -> str:
         You are a query refiner. Given the conversation so far and the user's latest query,
         rewrite the latest query into a short, direct query that will best match relevant documents
         in a Czech knowledge base. If the conversation is in Czech, keep it in Czech; if in English,
-        keep it in English. Avoid any extra explanation or commentary. Simply return the refined query.
+        keep it in English. Avoid any extra explanation or commentary. Simply return the refined query that has all important informations
         
         Conversation so far:
         {conversation_context}
@@ -236,7 +236,7 @@ def refine_query(original_query: str, conversation_context: str) -> str:
 # Memory-Efficient Retrieval
 ################################################################################
 
-def get_relevant_docs(query: str, top_k: int = 2) -> list:
+def get_relevant_docs(query: str, top_k: int = 5) -> list:
     """
     1) Embeds the query in a small batch (batch_size=1, no progress bar)
     2) Uses Milvus search to retrieve top_k documents
