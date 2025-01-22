@@ -20,8 +20,16 @@ import hmac
 import threading
 from dotenv import load_dotenv
 
-# Import the backend module
+# Import the improved backend module (with multi-vector embeddings, etc.)
 import backend
+
+# For summarizing long conversations (optional huggingface approach)
+try:
+    from transformers import pipeline
+
+    conversation_summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+except:
+    conversation_summarizer = None
 
 # FastAPI app initialization
 app = FastAPI()
@@ -62,7 +70,7 @@ slack_client = WebClient(token=SLACK_BOT_TOKEN)
 model_lock = threading.Lock()
 llm_lock = threading.Lock()
 
-# Initialize backend (Milvus, Neo4j, Model)
+# Initialize backend (Milvus, Neo4j, Models)
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "testtest")
@@ -81,10 +89,15 @@ backend.initialize_all(
 llm = Ollama(model="llama3.1:8b")
 
 ################################################################################
-# Constants for controlling prompt size
+# Configurable Constants
 ################################################################################
+
 MAX_CONVERSATION_CHARS = 3000
 MAX_CONTEXT_CHARS = 3000
+
+# If conversation grows beyond this length, we do an automatic summary
+CONVERSATION_SUMMARY_TRIGGER = 4000
+
 
 ################################################################################
 # Pydantic Models
@@ -94,36 +107,45 @@ class UserCredentials(BaseModel):
     username: str
     password: str
 
+
 class QueryRequest(BaseModel):
     query: str
     new_chat: Optional[bool] = True
     chat_id: Optional[str] = None
 
+
 class RegistrationResponse(BaseModel):
     message: str
+
 
 class LoginResponse(BaseModel):
     access_token: str
     message: str
+
 
 class ChatResponse(BaseModel):
     response: str
     sources: Optional[str]
     chat_id: Optional[str]
 
+
 class UpdateRoleRequest(BaseModel):
     username: str
     new_role: str
 
+
 class CreateWorkspaceRequest(BaseModel):
     name: str
+
 
 class AssignUserRequest(BaseModel):
     user_id: int
 
+
 class StorageConfig(BaseModel):
     datalake_type: str
     config: dict
+
 
 ################################################################################
 # Auth / Helpers
@@ -143,6 +165,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         return int(user_id)
     except JWTError:
         raise credentials_exception
+
 
 async def get_current_user_with_role(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
@@ -169,6 +192,7 @@ async def get_current_user_with_role(token: str = Depends(oauth2_scheme)):
     except JWTError:
         raise credentials_exception
 
+
 def create_access_token(data: dict, expires_delta: Union[timedelta, None] = None):
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
@@ -176,7 +200,13 @@ def create_access_token(data: dict, expires_delta: Union[timedelta, None] = None
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
+
 def save_conversation(user_id, chat_id, query, response):
+    """
+    Saves user+assistant messages in the DB.
+    We store them in user_conversations as raw text.
+    Potentially used later for summarization if it becomes too large.
+    """
     connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
     try:
@@ -196,34 +226,35 @@ def save_conversation(user_id, chat_id, query, response):
         cursor.close()
         connection.close()
 
+
 def role_required(required_roles: list):
     def decorator(current_user=Depends(get_current_user_with_role)):
         if current_user["role"] not in required_roles:
             raise HTTPException(status_code=403, detail="Not enough permissions")
         return current_user
+
     return decorator
 
+
 ################################################################################
-# NEW: Query Refinement Function
+# Query Refinement & Summaries
 ################################################################################
 
 def refine_query(original_query: str, conversation_context: str) -> str:
     """
-    Use the LLM to produce a short, direct refined query in the same language
-    as the user. The refined query should incorporate any relevant context
-    from the conversation so far, but must not contain meta commentary.
+    Use the LLM to produce a short, direct refined query in the same language as the user.
     """
     prompt_for_refinement = f"""
         You are a query refiner. Given the conversation so far and the user's latest query,
         rewrite the latest query into a short, direct query that will best match relevant documents
-        in a Czech knowledge base. If the conversation is in Czech, keep it in Czech; if in English,
-        keep it in English. Avoid any extra explanation or commentary. Simply return the refined query that has all important informations
-        
+        in the knowledge base. If the conversation is in Czech, keep it in Czech; if in English,
+        keep it in English. Avoid any extra explanation or commentary. Simply return the refined query that has all important information.
+
         Conversation so far:
         {conversation_context}
-        
+
         User's latest query: {original_query}
-        
+
         Refined query (no additional text, just the query):
         """.strip()
 
@@ -232,41 +263,205 @@ def refine_query(original_query: str, conversation_context: str) -> str:
     return refined_query
 
 
+def summarize_conversation(conversation_text: str) -> str:
+    """
+    Summarizes the conversation if conversation_summarizer is available;
+    otherwise, do a naive approach.
+    """
+    if conversation_summarizer:
+        try:
+            result = conversation_summarizer(conversation_text, max_length=100, min_length=50, do_sample=False)
+            summary = result[0]["summary_text"]
+            return summary.strip()
+        except Exception as e:
+            print(f"Summarization error: {e}")
+
+    # fallback naive approach
+    truncated = conversation_text[:500] + "..."
+    return f"Summary of conversation: {truncated}"
+
+
+def maybe_summarize_long_conversation(user_id: int, chat_id: str):
+    """
+    If the conversation is too long, we automatically summarize it
+    and store that summary as a new conversation entry (like a running memory).
+    """
+    connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            """
+            SELECT conversation 
+            FROM user_conversations 
+            WHERE user_id = %s AND chat_id = %s 
+            ORDER BY id ASC
+            """,
+            (user_id, chat_id)
+        )
+        rows = cursor.fetchall()
+        full_conv = "\n".join([r[0] for r in rows])
+        if len(full_conv) > CONVERSATION_SUMMARY_TRIGGER:
+            # Summarize
+            summary = summarize_conversation(full_conv)
+            # Insert the summary as a new "turn"
+            cursor.execute(
+                """
+                INSERT INTO user_conversations (user_id, chat_id, conversation)
+                VALUES (%s, %s, %s)
+                """,
+                (user_id, chat_id, f"AI (conversation summary): {summary}")
+            )
+            # Optionally delete older entries or keep them
+            # For now, let's just keep them.
+            connection.commit()
+            return True
+        return False
+    except Exception as e:
+        print(f"Error in maybe_summarize_long_conversation: {e}")
+    finally:
+        cursor.close()
+        connection.close()
+
+
 ################################################################################
-# Memory-Efficient Retrieval
+# Multi-Vector + Graph Retrieval
 ################################################################################
 
-def get_relevant_docs(query: str, top_k: int = 5) -> list:
+def hybrid_search(query: str, top_k: int = 5) -> list:
     """
-    1) Embeds the query in a small batch (batch_size=1, no progress bar)
-    2) Uses Milvus search to retrieve top_k documents
-    3) Looks up doc content in Neo4j
+    Demonstrates a multi-vector retrieval (semantic + lexical) approach.
+    1) Embed the query using both models
+    2) Search in both Milvus collections
+    3) Merge results (by average or max of similarity)
+    4) Return top_k doc_ids
     """
+    # Step 1: embed query in both models
     with model_lock:
-        query_embedding = backend.embedding_model.encode(
-            [query],
-            show_progress_bar=False,  # no progress bar
-            batch_size=1             # reduce memory usage
-        )[0].astype(np.float32)
+        sem_emb = backend.semantic_embedding_model.encode([query], show_progress_bar=False)[0].astype(np.float32)
+        lex_emb = backend.lexical_embedding_model.encode([query], show_progress_bar=False)[0].astype(np.float32)
 
-    # Lower ef to reduce overhead (speed up at slight accuracy cost)
-    search_params = {"metric_type": "COSINE", "params": {"ef": 64}}
-    search_results = backend.collection.search(
-        data=[query_embedding.tolist()],
+    # Step 2: do Milvus searches
+    sem_search_params = {"metric_type": "COSINE", "params": {"ef": 64}}
+    lex_search_params = {"metric_type": "COSINE", "params": {"ef": 64}}
+
+    sem_results = backend.semantic_collection.search(
+        data=[sem_emb.tolist()],
         anns_field="embedding",
-        param=search_params,
-        limit=top_k,
+        param=sem_search_params,
+        limit=top_k * 2,  # maybe retrieve more, then merge
         output_fields=["document_id"]
-    )
+    )[0]
 
-    relevant_doc_ids = [hit.entity.get("document_id") for hit in search_results[0]]
+    lex_results = backend.lexical_collection.search(
+        data=[lex_emb.tolist()],
+        anns_field="embedding",
+        param=lex_search_params,
+        limit=top_k * 2,
+        output_fields=["document_id"]
+    )[0]
+
+    # Step 3: unify and rank
+    # We'll build a dict doc_id -> aggregated_score
+    score_map = {}
+
+    # fill from sem_results
+    for hit in sem_results:
+        doc_id = hit.entity.get("document_id")
+        # milvus returns distance or similarity, depending on your config
+        # if it's distance, we might convert to 1 - distance. Here let's assume it's similarity
+        score = hit.score
+        if doc_id not in score_map:
+            score_map[doc_id] = []
+        score_map[doc_id].append(score)
+
+    # fill from lex_results
+    for hit in lex_results:
+        doc_id = hit.entity.get("document_id")
+        score = hit.score
+        if doc_id not in score_map:
+            score_map[doc_id] = []
+        score_map[doc_id].append(score)
+
+    # average the scores
+    doc_id_scores = []
+    for doc_id, scores in score_map.items():
+        # e.g. average or max or sum
+        avg_score = sum(scores) / len(scores)
+        doc_id_scores.append((doc_id, avg_score))
+
+    # sort by score desc
+    doc_id_scores.sort(key=lambda x: x[1], reverse=True)
+    top_doc_ids = [t[0] for t in doc_id_scores[:top_k]]
+    return top_doc_ids
+
+
+def generate_cypher_query(refined_query: str) -> str:
+    """
+    Use LLM to generate a possible Cypher query to find relevant docs in the graph
+    based on topics, entities, or relationships. This is optional and might not
+    always produce valid Cypher.
+    """
+    prompt = f"""
+    You are a Cypher query generator. The user (in the knowledge base) asked a refined query:
+    '{refined_query}'
+
+    We have a Neo4j graph with :Document, :Topic, :Entity, and relationships like:
+    (Document)-[:HAS_TOPIC]->(Topic), (Document)-[:MENTIONS]->(Entity),
+    (Document)-[:RELATED {type: 'SIMILAR_TO', ...}]->(Document).
+
+    Generate a short Cypher query that tries to find Document nodes relevant to the user query.
+    Only output the Cypher. 
+    """.strip()
+
+    with llm_lock:
+        possible_cypher = llm.invoke(prompt).strip()
+    return possible_cypher
+
+
+def run_cypher_query(query_text: str, top_k: int = 5) -> list:
+    """
+    Attempts to run a given Cypher query, expecting it to return a list of doc_ids
+    from Document nodes. We'll parse them out. This is purely optional.
+    """
+    doc_ids = []
+    with backend.driver.session() as session:
+        try:
+            result = session.run(query_text)
+            # We assume the query returns records that have a 'doc_id' or 'd.doc_id'
+            # We'll collect them
+            for rec in result:
+                # guess a field name
+                # if the LLM yields something like RETURN d.doc_id as doc_id:
+                # we can look for rec['doc_id']
+                # We'll guess "doc_id" or "d.doc_id"
+                if "doc_id" in rec.keys():
+                    doc_ids.append(rec["doc_id"])
+                else:
+                    # or the record might be something else
+                    # or we might try rec[0]
+                    val = rec.values()[0]
+                    if isinstance(val, int):
+                        doc_ids.append(val)
+        except Exception as e:
+            print(f"Cypher query failed or invalid: {e}")
+    # deduplicate
+    doc_ids = list(set(doc_ids))
+    return doc_ids[:top_k]
+
+
+def retrieve_docs_from_neo4j(doc_ids: list) -> list:
+    """
+    Given a list of doc_ids, fetch their content and metadata from Neo4j.
+    """
+    if not doc_ids:
+        return []
 
     with backend.driver.session() as session:
         result = session.run("""
             MATCH (d:Document)
             WHERE d.doc_id IN $doc_ids
             RETURN d.content AS content, d.metadata AS metadata
-        """, doc_ids=relevant_doc_ids)
+        """, doc_ids=doc_ids)
 
         documents = []
         for record in result:
@@ -276,6 +471,29 @@ def get_relevant_docs(query: str, top_k: int = 5) -> list:
                 "filename": meta.get("filename", "Unknown")
             })
     return documents
+
+
+def get_hybrid_plus_cypher_docs(refined_query: str, top_k: int = 5, use_cypher_expansion: bool = True) -> list:
+    """
+    1. Multi-vector search in Milvus
+    2. (Optional) Generate a Cypher query to find relevant docs in Neo4j
+    3. Merge doc_ids, retrieve content from Neo4j
+    """
+    # Step 1: multi-vector search
+    doc_ids_hybrid = hybrid_search(refined_query, top_k=top_k)
+
+    # Step 2: optional graph expansion
+    doc_ids_cypher = []
+    if use_cypher_expansion:
+        possible_cypher = generate_cypher_query(refined_query)
+        doc_ids_cypher = run_cypher_query(possible_cypher, top_k=top_k)
+
+    # unify
+    all_ids = list(set(doc_ids_hybrid + doc_ids_cypher))
+    # Step 3: fetch docs from Neo4j
+    docs = retrieve_docs_from_neo4j(all_ids)
+    return docs
+
 
 ################################################################################
 # Slack Helpers
@@ -295,6 +513,7 @@ async def verify_slack_signature(request: Request):
     slack_signature = request.headers.get("X-Slack-Signature")
     return hmac.compare_digest(computed_signature, slack_signature)
 
+
 async def process_slack_command(user_query: str, channel_id: str):
     try:
         response = generate_response(
@@ -312,12 +531,14 @@ async def process_slack_command(user_query: str, channel_id: str):
             text="Sorry, something went wrong while processing your request."
         )
 
+
 def get_storage_settings():
     config_path = "storage_config.json"
     if not os.path.exists(config_path):
         raise HTTPException(status_code=500, detail="Storage configuration not found.")
     with open(config_path, "r") as f:
         return json.load(f)
+
 
 ################################################################################
 # Endpoints
@@ -342,6 +563,7 @@ def get_user_chats(current_user_id: int = Depends(get_current_user)):
         cursor.close()
         connection.close()
 
+
 @app.get("/chat/history/{chat_id}", response_model=dict)
 def get_chat_history(chat_id: str, current_user_id: int = Depends(get_current_user)):
     connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
@@ -362,10 +584,10 @@ def get_chat_history(chat_id: str, current_user_id: int = Depends(get_current_us
         cursor.close()
         connection.close()
 
+
 @app.post("/register")
 def register_user(username: str = Form(...), password: str = Form(...)):
     hashed_password = hashlib.sha256(password.encode()).hexdigest()
-    print("DB_CONFIG:", DB_CONFIG)
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
     try:
@@ -377,6 +599,7 @@ def register_user(username: str = Form(...), password: str = Form(...)):
     finally:
         cursor.close()
         connection.close()
+
 
 @app.post("/login")
 def login_for_access_token(username: str = Form(...), password: str = Form(...)):
@@ -395,10 +618,11 @@ def login_for_access_token(username: str = Form(...), password: str = Form(...))
         cursor.close()
         connection.close()
 
+
 @app.post("/workspaces")
 def create_workspace(
-    request: CreateWorkspaceRequest,
-    current_user=Depends(role_required(["admin", "superadmin"]))
+        request: CreateWorkspaceRequest,
+        current_user=Depends(role_required(["admin", "superadmin"]))
 ):
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
@@ -411,11 +635,12 @@ def create_workspace(
         cursor.close()
         connection.close()
 
+
 @app.post("/workspaces/{workspace_id}/assign-user")
 def assign_user_to_workspace(
-    workspace_id: int,
-    request: AssignUserRequest,
-    current_user=Depends(role_required(["admin", "superadmin"]))
+        workspace_id: int,
+        request: AssignUserRequest,
+        current_user=Depends(role_required(["admin", "superadmin"]))
 ):
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
@@ -430,12 +655,13 @@ def assign_user_to_workspace(
         cursor.close()
         connection.close()
 
+
 @app.post("/documents")
 def upload_document(
-    file: UploadFile = File(...),
-    scope: str = Form(...),
-    chat_id: Optional[str] = Form(None),
-    current_user=Depends(role_required(["user", "admin", "superadmin"]))
+        file: UploadFile = File(...),
+        scope: str = Form(...),
+        chat_id: Optional[str] = Form(None),
+        current_user=Depends(role_required(["user", "admin", "superadmin"]))
 ):
     if scope not in ["chat", "profile", "workspace", "system"]:
         raise HTTPException(status_code=400, detail="Invalid scope")
@@ -471,104 +697,121 @@ def upload_document(
 
     return {"message": f"Document uploaded successfully with scope {scope}"}
 
+
 @app.post("/chat", response_model=ChatResponse)
 def generate_response(
-    request: QueryRequest,
-    current_user=Depends(get_current_user_with_role)
+        request: QueryRequest,
+        current_user=Depends(get_current_user_with_role)
 ):
+    """
+    Main chat endpoint with multi-vector retrieval + optional graph expansions,
+    conversation summarization, and query refinement.
+    """
     print(f"Request received: {request.dict()}")
 
-    # ---------------------------------------------
-    # 1) Get or create the chat_id and conversation
-    # ---------------------------------------------
+    # 1) Get or create chat_id
     if request.new_chat:
         chat_id = str(uuid.uuid4())
-        conversation = ""
+        conversation_so_far = ""
     else:
-        chat_id = request.chat_id
-        if not chat_id:
+        if not request.chat_id:
             raise HTTPException(status_code=400, detail="chat_id is required when new_chat is False")
+        chat_id = request.chat_id
 
+        # Fetch the entire conversation from DB
         connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
         cursor = connection.cursor()
         try:
-            cursor.execute(
-                """
+            cursor.execute("""
                 SELECT conversation 
                 FROM user_conversations 
-                WHERE user_id = %s 
-                  AND chat_id = %s 
+                WHERE user_id = %s AND chat_id = %s 
                 ORDER BY id ASC
-                """,
-                (current_user["user_id"], chat_id)
-            )
-            result = cursor.fetchall()
-            # Join all conversation entries
-            conversation = "\n".join([record[0] for record in result])
+            """, (current_user["user_id"], chat_id))
+            rows = cursor.fetchall()
+            conversation_so_far = "\n".join([r[0] for r in rows])
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error fetching chat history: {e}")
         finally:
             cursor.close()
             connection.close()
 
-    # ---------------------------------------------
-    # 2) Refine the user's current query with LLM
-    # ---------------------------------------------
-    refined_query = refine_query(request.query, conversation)
+    # 2) Possibly summarize if conversation is too long
+    maybe_summarize_long_conversation(current_user["user_id"], chat_id)
+
+    # Reload conversation if a summary was added
+    # (just to keep everything consistent)
+    connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
+    cursor = connection.cursor()
+    try:
+        cursor.execute("""
+            SELECT conversation 
+            FROM user_conversations 
+            WHERE user_id = %s AND chat_id = %s 
+            ORDER BY id ASC
+        """, (current_user["user_id"], chat_id))
+        rows = cursor.fetchall()
+        conversation_so_far = "\n".join([r[0] for r in rows])
+    finally:
+        cursor.close()
+        connection.close()
+
+    # 3) Refine query
+    refined_query = refine_query(request.query, conversation_so_far)
     print(f"Refined query: {refined_query}")
 
-    # ---------------------------------------------
-    # 3) Retrieve relevant docs based on refined query
-    # ---------------------------------------------
-    documents = get_relevant_docs(refined_query, top_k=2)
+    # 4) Retrieve docs using hybrid search + optional graph expansions
+    docs = get_hybrid_plus_cypher_docs(refined_query, top_k=3, use_cypher_expansion=True)
 
-    # If conversation is too large, truncate
-    if len(conversation) > MAX_CONVERSATION_CHARS:
-        conversation = conversation[:MAX_CONVERSATION_CHARS] + " ... [truncated]"
+    # Build short context from retrieved docs
+    context_text = ""
+    for doc in docs:
+        piece = f"{doc['content']}\n(Source: {doc['filename']})\n\n"
+        if len(context_text + piece) < MAX_CONTEXT_CHARS:
+            context_text += piece
+        else:
+            context_text += "... [truncated]"
+            break
 
-    # Build context from docs (also truncated if too large)
-    context = ""
-    for doc in documents:
-        content = doc['content'].encode('utf-8', errors='replace').decode('utf-8')
-        filename = doc['filename'].encode('utf-8', errors='replace').decode('utf-8')
-        context += f"{content}\n(Source: {filename})\n\n"
-    if len(context) > MAX_CONTEXT_CHARS:
-        context = context[:MAX_CONTEXT_CHARS] + " ... [truncated]"
+    # If conversation is too large, we also truncate it
+    truncated_conversation = conversation_so_far
+    if len(truncated_conversation) > MAX_CONVERSATION_CHARS:
+        truncated_conversation = truncated_conversation[:MAX_CONVERSATION_CHARS] + " ... [truncated]"
 
-    # ---------------------------------------------
-    # 4) Construct the final prompt and call the LLM
-    # ---------------------------------------------
+    # 5) Construct prompt for LLM
     prompt = f"""
-        You are a helpdesk assistant who provides concise, step-by-step solutions.
+        You are a helpful assistant who provides concise, step-by-step solutions.
         Conversation so far:
-        {conversation}
-        
+        {truncated_conversation}
+
         Relevant context:
-        {context}
-        
+        {context_text}
+
         Question:
         {request.query}
-        
-        Your concise answer:
-        """.strip()
 
+        Your concise answer:
+    """.strip()
+
+    # 6) Generate response
     with llm_lock:
         response_text = llm.invoke(prompt).strip()
     response_text = response_text.encode('utf-8', errors='replace').decode('utf-8')
 
-    # ---------------------------------------------
-    # 5) Save conversation and return response
-    # ---------------------------------------------
+    # 7) Save conversation turn
     save_conversation(current_user["user_id"], chat_id, request.query, response_text)
 
-    source_names = ", ".join([doc['filename'] for doc in documents])
-    formatted_response = f"{response_text}\n\nSources:\n{source_names.replace(',', '\\n')}"
+    # Return top doc filenames as "sources"
+    source_names = [doc['filename'] for doc in docs]
+    sources_str = "\n".join(source_names)
+    final_answer = f"{response_text}\n\nSources:\n{sources_str}"
 
     return {
-        "response": formatted_response,
-        "sources": source_names,
+        "response": final_answer,
+        "sources": ", ".join(source_names),
         "chat_id": chat_id
     }
+
 
 @app.post("/slack/events")
 async def slack_events(request: Request):
@@ -580,7 +823,6 @@ async def slack_events(request: Request):
     if event.get("type") == "message" and not event.get("bot_id"):
         user_query = event.get("text")
         channel_id = event.get("channel")
-
         try:
             response = generate_response(
                 QueryRequest(query=user_query, new_chat=True),
@@ -592,6 +834,7 @@ async def slack_events(request: Request):
 
     return JSONResponse(content={"message": "Event received"})
 
+
 @app.post("/slack/command")
 async def slack_command(request: Request, background_tasks: BackgroundTasks):
     if not await verify_slack_signature(request):
@@ -600,14 +843,14 @@ async def slack_command(request: Request, background_tasks: BackgroundTasks):
     form_data = await request.form()
     user_query = form_data.get("text")
     channel_id = form_data.get("channel_id")
-
     background_tasks.add_task(process_slack_command, user_query, channel_id)
     return JSONResponse(content={"response_type": "ephemeral", "text": "Processing your request..."})
 
+
 @app.post("/update-role")
 def update_role(
-    request: UpdateRoleRequest,
-    current_user=Depends(role_required(["admin","superadmin"]))
+        request: UpdateRoleRequest,
+        current_user=Depends(role_required(["admin", "superadmin"]))
 ):
     if request.new_role not in ["user", "admin", "superadmin"]:
         raise HTTPException(status_code=400, detail="Invalid role")
@@ -627,6 +870,7 @@ def update_role(
         cursor.close()
         connection.close()
 
+
 @app.get("/admin/users")
 def get_all_users(current_user=Depends(role_required(["superadmin"]))):
     connection = psycopg2.connect(**DB_CONFIG)
@@ -640,11 +884,12 @@ def get_all_users(current_user=Depends(role_required(["superadmin"]))):
         cursor.close()
         connection.close()
 
+
 @app.post("/admin/users/{user_id}/change-username")
 def change_username(
-    user_id: int,
-    new_username: str = Form(...),
-    current_user=Depends(role_required(["superadmin"]))
+        user_id: int,
+        new_username: str = Form(...),
+        current_user=Depends(role_required(["superadmin"]))
 ):
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
@@ -661,11 +906,12 @@ def change_username(
         cursor.close()
         connection.close()
 
+
 @app.post("/admin/users/{user_id}/change-password")
 def change_password(
-    user_id: int,
-    new_password: str = Form(...),
-    current_user=Depends(role_required(["superadmin"]))
+        user_id: int,
+        new_password: str = Form(...),
+        current_user=Depends(role_required(["superadmin"]))
 ):
     hashed_password = hashlib.sha256(new_password.encode()).hexdigest()
     connection = psycopg2.connect(**DB_CONFIG)
@@ -683,10 +929,11 @@ def change_password(
         cursor.close()
         connection.close()
 
+
 @app.get("/admin/users/{user_id}/chats")
-def get_user_chats(
-    user_id: int,
-    current_user=Depends(role_required(["superadmin"]))
+def get_user_chats_admin(
+        user_id: int,
+        current_user=Depends(role_required(["superadmin"]))
 ):
     connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
@@ -705,24 +952,27 @@ def get_user_chats(
         cursor.close()
         connection.close()
 
+
 @app.post("/embed-documents")
 def embed_documents(
-    directory: str = Form(...),
-    current_user=Depends(role_required(["admin", "superadmin"]))
+        directory: str = Form(...),
+        current_user=Depends(role_required(["admin", "superadmin"]))
 ):
     if not os.path.isdir(directory):
         raise HTTPException(status_code=400, detail="Invalid directory")
 
     try:
+        # This calls backend.process_documents which does chunking + embedding
         backend.process_documents(directory)
         return {"message": f"Documents in {directory} processed and embedded successfully."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/workspaces/{user_id}/list")
 def get_user_workspaces(
-    user_id: int,
-    current_user=Depends(role_required(["admin", "superadmin"]))
+        user_id: int,
+        current_user=Depends(role_required(["admin", "superadmin"]))
 ):
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
@@ -740,13 +990,13 @@ def get_user_workspaces(
         cursor.close()
         connection.close()
 
+
 @app.post("/configure-storage")
 def configure_storage(
-    storage_config: StorageConfig,
-    current_user=Depends(role_required(["superadmin"]))
+        storage_config: StorageConfig,
+        current_user=Depends(role_required(["superadmin"]))
 ):
     config_path = "storage_config.json"
     with open(config_path, "w") as f:
         json.dump(storage_config.dict(), f)
-
     return {"message": f"Storage configured successfully for {storage_config.datalake_type}"}
