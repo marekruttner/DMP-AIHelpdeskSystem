@@ -7,7 +7,7 @@ class ApiService {
   factory ApiService() => _instance;
   ApiService._internal();
 
-  final String baseUrl = 'http://localhost:8000';
+  final String baseUrl = 'http://100.85.225.62:8000';
   String? _token;
   String? _role;
 
