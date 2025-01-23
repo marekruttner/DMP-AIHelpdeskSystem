@@ -38,7 +38,8 @@ class ApiService {
     final response = await http.post(
       Uri.parse('$baseUrl/login'),
       headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body: 'username=${Uri.encodeQueryComponent(username)}&password=${Uri.encodeQueryComponent(password)}',
+      body:
+      'username=${Uri.encodeQueryComponent(username)}&password=${Uri.encodeQueryComponent(password)}',
     );
 
     if (response.statusCode == 200) {
@@ -57,7 +58,8 @@ class ApiService {
     final response = await http.post(
       Uri.parse('$baseUrl/register'),
       headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body: 'username=${Uri.encodeQueryComponent(username)}&password=${Uri.encodeQueryComponent(password)}',
+      body:
+      'username=${Uri.encodeQueryComponent(username)}&password=${Uri.encodeQueryComponent(password)}',
     );
 
     if (response.statusCode == 200) {
@@ -69,7 +71,8 @@ class ApiService {
   }
 
   Future<List<dynamic>> getChats() async {
-    final response = await http.get(Uri.parse('$baseUrl/chats'), headers: authHeaders);
+    final response =
+    await http.get(Uri.parse('$baseUrl/chats'), headers: authHeaders);
     if (response.statusCode == 200) {
       final data = json.decode(utf8.decode(response.bodyBytes));
       return data['chats'] ?? [];
@@ -79,7 +82,10 @@ class ApiService {
   }
 
   Future<Map<String, dynamic>> getChatHistory(String chatId) async {
-    final response = await http.get(Uri.parse('$baseUrl/chat/history/$chatId'), headers: authHeaders);
+    final response = await http.get(
+      Uri.parse('$baseUrl/chat/history/$chatId'),
+      headers: authHeaders,
+    );
     if (response.statusCode == 200) {
       return json.decode(utf8.decode(response.bodyBytes));
     } else {
@@ -87,7 +93,8 @@ class ApiService {
     }
   }
 
-  Future<Map<String, dynamic>> chat(String query, {required bool newChat, String? chatId}) async {
+  Future<Map<String, dynamic>> chat(String query,
+      {required bool newChat, String? chatId}) async {
     final body = {'query': query, 'new_chat': newChat};
     if (chatId != null) body['chat_id'] = chatId;
 
@@ -95,7 +102,7 @@ class ApiService {
       Uri.parse('$baseUrl/chat'),
       headers: {
         ...authHeaders,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
       },
       body: json.encode(body),
     );
@@ -110,7 +117,8 @@ class ApiService {
   // Admin & Documents
 
   Future<List<dynamic>> getAllUsers() async {
-    final response = await http.get(Uri.parse('$baseUrl/admin/users'), headers: authHeaders);
+    final response =
+    await http.get(Uri.parse('$baseUrl/admin/users'), headers: authHeaders);
     if (response.statusCode == 200) {
       final data = json.decode(utf8.decode(response.bodyBytes));
       return data['users'] ?? [];
@@ -125,7 +133,7 @@ class ApiService {
       uri,
       headers: {
         ...authHeaders,
-        'Content-Type': 'application/x-www-form-urlencoded'
+        'Content-Type': 'application/x-www-form-urlencoded',
       },
       body: 'new_username=${Uri.encodeQueryComponent(newUsername)}',
     );
@@ -141,7 +149,7 @@ class ApiService {
       uri,
       headers: {
         ...authHeaders,
-        'Content-Type': 'application/x-www-form-urlencoded'
+        'Content-Type': 'application/x-www-form-urlencoded',
       },
       body: 'new_password=${Uri.encodeQueryComponent(newPassword)}',
     );
@@ -168,7 +176,7 @@ class ApiService {
       Uri.parse('$baseUrl/workspaces'),
       headers: {
         ...authHeaders,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
       },
       body: json.encode(payload),
     );
@@ -181,13 +189,14 @@ class ApiService {
     }
   }
 
-  Future<Map<String, dynamic>> assignUserToWorkspace(int workspaceId, int userId) async {
+  Future<Map<String, dynamic>> assignUserToWorkspace(
+      int workspaceId, int userId) async {
     final payload = {"user_id": userId};
     final response = await http.post(
       Uri.parse('$baseUrl/workspaces/$workspaceId/assign-user'),
       headers: {
         ...authHeaders,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
       },
       body: json.encode(payload),
     );
@@ -219,7 +228,7 @@ class ApiService {
       Uri.parse('$baseUrl/update-role'),
       headers: {
         ...authHeaders,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
       },
       body: json.encode(payload),
     );
@@ -230,8 +239,12 @@ class ApiService {
     }
   }
 
-  Future<Map<String, dynamic>> uploadDocument(String filePath, String scope, {String? chatId}) async {
-    var request = http.MultipartRequest('POST', Uri.parse('$baseUrl/documents'));
+  Future<Map<String, dynamic>> uploadDocument(String filePath, String scope,
+      {String? chatId}) async {
+    var request = http.MultipartRequest(
+      'POST',
+      Uri.parse('$baseUrl/documents'),
+    );
     request.headers.addAll(authHeaders);
     request.files.add(await http.MultipartFile.fromPath('file', filePath));
     request.fields['scope'] = scope;
@@ -256,7 +269,7 @@ class ApiService {
       Uri.parse('$baseUrl/embed-documents'),
       headers: {
         ...authHeaders,
-        'Content-Type': 'application/x-www-form-urlencoded'
+        'Content-Type': 'application/x-www-form-urlencoded',
       },
       body: 'directory=${Uri.encodeQueryComponent(directory)}',
     );
@@ -264,6 +277,83 @@ class ApiService {
     if (response.statusCode != 200) {
       final errorData = json.decode(utf8.decode(response.bodyBytes));
       throw Exception(errorData['detail'] ?? 'Failed to embed documents');
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // NEW METHODS for copying from GDrive to local and configuring storage
+  // -------------------------------------------------------------------------
+  Future<Map<String, dynamic>> copyGoogleDriveToLocal(String folderId, bool isGlobal) async {
+    final uri = Uri.parse('$baseUrl/admin/copy-google-drive-to-local');
+    final request = http.MultipartRequest('POST', uri);
+    request.headers.addAll(authHeaders);
+
+    request.fields['folder_id'] = folderId;
+    request.fields['is_global'] = isGlobal.toString();
+
+    final streamedResponse = await request.send();
+    final response = await http.Response.fromStream(streamedResponse);
+
+    if (response.statusCode == 200) {
+      return json.decode(utf8.decode(response.bodyBytes));
+    } else {
+      final errorData = json.decode(utf8.decode(response.bodyBytes));
+      throw Exception(errorData['detail'] ?? 'Failed to copy from Google Drive to local.');
+    }
+  }
+
+  Future<Map<String, dynamic>> configureStorageDashboard(String datalakeType) async {
+    final uri = Uri.parse('$baseUrl/admin/configure-storage-dashboard');
+    final request = http.MultipartRequest('POST', uri);
+    request.headers.addAll(authHeaders);
+
+    request.fields['datalake_type'] = datalakeType;
+
+    final streamedResponse = await request.send();
+    final response = await http.Response.fromStream(streamedResponse);
+
+    if (response.statusCode == 200) {
+      return json.decode(utf8.decode(response.bodyBytes));
+    } else {
+      final errorData = json.decode(utf8.decode(response.bodyBytes));
+      throw Exception(errorData['detail'] ?? 'Failed to configure storage');
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // NEW METHOD to upload & embed a file to local datalake
+  // -------------------------------------------------------------------------
+  Future<Map<String, dynamic>> uploadFileToLocalDatalake(
+      String filePath,
+      bool isGlobal, {
+        int? workspaceId,
+      }) async {
+    final uri = Uri.parse('$baseUrl/local-datalake/upload-file');
+    final request = http.MultipartRequest('POST', uri);
+
+    // Add auth header
+    request.headers.addAll(authHeaders);
+
+    // Attach file
+    request.files.add(await http.MultipartFile.fromPath('file', filePath));
+
+    // Fields: is_global and optionally workspace_id
+    request.fields['is_global'] = isGlobal.toString();
+    if (workspaceId != null) {
+      request.fields['workspace_id'] = workspaceId.toString();
+    }
+
+    // Send request
+    final streamedResponse = await request.send();
+    final response = await http.Response.fromStream(streamedResponse);
+
+    if (response.statusCode == 200) {
+      return json.decode(utf8.decode(response.bodyBytes));
+    } else {
+      final errorData = json.decode(utf8.decode(response.bodyBytes));
+      throw Exception(
+        errorData['detail'] ?? 'Failed to upload file to local datalake.',
+      );
     }
   }
 }
