@@ -20,13 +20,17 @@ import hmac
 import threading
 from dotenv import load_dotenv
 
+# ------------------------------------------------------------------------
+# IMPORTANT: import your factory method from the storage_integration script
+# ------------------------------------------------------------------------
+from storage_integrations import integrate_data_into_datalake
+
 # Import the improved backend module (with multi-vector embeddings, etc.)
 import backend
 
 # For summarizing long conversations (optional huggingface approach)
 try:
     from transformers import pipeline
-
     conversation_summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
 except:
     conversation_summarizer = None
@@ -98,7 +102,6 @@ MAX_CONTEXT_CHARS = 3000
 # If conversation grows beyond this length, we do an automatic summary
 CONVERSATION_SUMMARY_TRIGGER = 4000
 
-
 ################################################################################
 # Pydantic Models
 ################################################################################
@@ -107,45 +110,36 @@ class UserCredentials(BaseModel):
     username: str
     password: str
 
-
 class QueryRequest(BaseModel):
     query: str
     new_chat: Optional[bool] = True
     chat_id: Optional[str] = None
 
-
 class RegistrationResponse(BaseModel):
     message: str
-
 
 class LoginResponse(BaseModel):
     access_token: str
     message: str
-
 
 class ChatResponse(BaseModel):
     response: str
     sources: Optional[str]
     chat_id: Optional[str]
 
-
 class UpdateRoleRequest(BaseModel):
     username: str
     new_role: str
 
-
 class CreateWorkspaceRequest(BaseModel):
     name: str
-
 
 class AssignUserRequest(BaseModel):
     user_id: int
 
-
 class StorageConfig(BaseModel):
     datalake_type: str
     config: dict
-
 
 ################################################################################
 # Auth / Helpers
@@ -165,7 +159,6 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         return int(user_id)
     except JWTError:
         raise credentials_exception
-
 
 async def get_current_user_with_role(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
@@ -192,14 +185,12 @@ async def get_current_user_with_role(token: str = Depends(oauth2_scheme)):
     except JWTError:
         raise credentials_exception
 
-
 def create_access_token(data: dict, expires_delta: Union[timedelta, None] = None):
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
-
 
 def save_conversation(user_id, chat_id, query, response):
     """
@@ -226,15 +217,12 @@ def save_conversation(user_id, chat_id, query, response):
         cursor.close()
         connection.close()
 
-
 def role_required(required_roles: list):
     def decorator(current_user=Depends(get_current_user_with_role)):
         if current_user["role"] not in required_roles:
             raise HTTPException(status_code=403, detail="Not enough permissions")
         return current_user
-
     return decorator
-
 
 ################################################################################
 # Query Refinement & Summaries
@@ -262,7 +250,6 @@ def refine_query(original_query: str, conversation_context: str) -> str:
         refined_query = llm.invoke(prompt_for_refinement).strip()
     return refined_query
 
-
 def summarize_conversation(conversation_text: str) -> str:
     """
     Summarizes the conversation if conversation_summarizer is available;
@@ -279,7 +266,6 @@ def summarize_conversation(conversation_text: str) -> str:
     # fallback naive approach
     truncated = conversation_text[:500] + "..."
     return f"Summary of conversation: {truncated}"
-
 
 def maybe_summarize_long_conversation(user_id: int, chat_id: str):
     """
@@ -322,7 +308,6 @@ def maybe_summarize_long_conversation(user_id: int, chat_id: str):
         cursor.close()
         connection.close()
 
-
 ################################################################################
 # Multi-Vector + Graph Retrieval
 ################################################################################
@@ -348,7 +333,7 @@ def hybrid_search(query: str, top_k: int = 5) -> list:
         data=[sem_emb.tolist()],
         anns_field="embedding",
         param=sem_search_params,
-        limit=top_k * 2,  # maybe retrieve more, then merge
+        limit=top_k * 2,
         output_fields=["document_id"]
     )[0]
 
@@ -361,20 +346,15 @@ def hybrid_search(query: str, top_k: int = 5) -> list:
     )[0]
 
     # Step 3: unify and rank
-    # We'll build a dict doc_id -> aggregated_score
     score_map = {}
 
-    # fill from sem_results
     for hit in sem_results:
         doc_id = hit.entity.get("document_id")
-        # milvus returns distance or similarity, depending on your config
-        # if it's distance, we might convert to 1 - distance. Here let's assume it's similarity
         score = hit.score
         if doc_id not in score_map:
             score_map[doc_id] = []
         score_map[doc_id].append(score)
 
-    # fill from lex_results
     for hit in lex_results:
         doc_id = hit.entity.get("document_id")
         score = hit.score
@@ -382,18 +362,14 @@ def hybrid_search(query: str, top_k: int = 5) -> list:
             score_map[doc_id] = []
         score_map[doc_id].append(score)
 
-    # average the scores
     doc_id_scores = []
     for doc_id, scores in score_map.items():
-        # e.g. average or max or sum
         avg_score = sum(scores) / len(scores)
         doc_id_scores.append((doc_id, avg_score))
 
-    # sort by score desc
     doc_id_scores.sort(key=lambda x: x[1], reverse=True)
     top_doc_ids = [t[0] for t in doc_id_scores[:top_k]]
     return top_doc_ids
-
 
 def generate_cypher_query(refined_query: str) -> str:
     """
@@ -416,38 +392,26 @@ def generate_cypher_query(refined_query: str) -> str:
         possible_cypher = llm.invoke(prompt).strip()
     return possible_cypher
 
-
-
 def run_cypher_query(query_text: str, top_k: int = 5) -> list:
     """
     Attempts to run a given Cypher query, expecting it to return a list of doc_ids
-    from Document nodes. We'll parse them out. This is purely optional.
+    from Document nodes. We'll parse them out.
     """
     doc_ids = []
     with backend.driver.session() as session:
         try:
             result = session.run(query_text)
-            # We assume the query returns records that have a 'doc_id' or 'd.doc_id'
-            # We'll collect them
             for rec in result:
-                # guess a field name
-                # if the LLM yields something like RETURN d.doc_id as doc_id:
-                # we can look for rec['doc_id']
-                # We'll guess "doc_id" or "d.doc_id"
                 if "doc_id" in rec.keys():
                     doc_ids.append(rec["doc_id"])
                 else:
-                    # or the record might be something else
-                    # or we might try rec[0]
                     val = rec.values()[0]
                     if isinstance(val, int):
                         doc_ids.append(val)
         except Exception as e:
             print(f"Cypher query failed or invalid: {e}")
-    # deduplicate
     doc_ids = list(set(doc_ids))
     return doc_ids[:top_k]
-
 
 def retrieve_docs_from_neo4j(doc_ids: list) -> list:
     """
@@ -457,12 +421,14 @@ def retrieve_docs_from_neo4j(doc_ids: list) -> list:
         return []
 
     with backend.driver.session() as session:
-        result = session.run("""
+        result = session.run(
+            """
             MATCH (d:Document)
             WHERE d.doc_id IN $doc_ids
             RETURN d.content AS content, d.metadata AS metadata
-        """, doc_ids=doc_ids)
-
+            """,
+            doc_ids=doc_ids
+        )
         documents = []
         for record in result:
             meta = json.loads(record['metadata'])
@@ -472,28 +438,22 @@ def retrieve_docs_from_neo4j(doc_ids: list) -> list:
             })
     return documents
 
-
 def get_hybrid_plus_cypher_docs(refined_query: str, top_k: int = 5, use_cypher_expansion: bool = True) -> list:
     """
     1. Multi-vector search in Milvus
     2. (Optional) Generate a Cypher query to find relevant docs in Neo4j
     3. Merge doc_ids, retrieve content from Neo4j
     """
-    # Step 1: multi-vector search
     doc_ids_hybrid = hybrid_search(refined_query, top_k=top_k)
 
-    # Step 2: optional graph expansion
     doc_ids_cypher = []
     if use_cypher_expansion:
         possible_cypher = generate_cypher_query(refined_query)
         doc_ids_cypher = run_cypher_query(possible_cypher, top_k=top_k)
 
-    # unify
     all_ids = list(set(doc_ids_hybrid + doc_ids_cypher))
-    # Step 3: fetch docs from Neo4j
     docs = retrieve_docs_from_neo4j(all_ids)
     return docs
-
 
 ################################################################################
 # Slack Helpers
@@ -513,24 +473,19 @@ async def verify_slack_signature(request: Request):
     slack_signature = request.headers.get("X-Slack-Signature")
     return hmac.compare_digest(computed_signature, slack_signature)
 
-
 async def process_slack_command(user_query: str, channel_id: str):
     try:
         response = generate_response(
             QueryRequest(query=user_query, new_chat=True),
             current_user={"user_id": 1, "role": "superadmin", "workspace_id": None}
         )
-        slack_client.chat_postMessage(
-            channel=channel_id,
-            text=response.response
-        )
+        slack_client.chat_postMessage(channel=channel_id, text=response.response)
     except Exception as e:
         print(f"Error processing Slack command: {e}")
         slack_client.chat_postMessage(
             channel=channel_id,
             text="Sorry, something went wrong while processing your request."
         )
-
 
 def get_storage_settings():
     config_path = "storage_config.json"
@@ -539,9 +494,8 @@ def get_storage_settings():
     with open(config_path, "r") as f:
         return json.load(f)
 
-
 ################################################################################
-# Endpoints
+# Existing Endpoints
 ################################################################################
 
 @app.get("/chats", response_model=dict)
@@ -549,13 +503,16 @@ def get_user_chats(current_user_id: int = Depends(get_current_user)):
     connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
     try:
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT chat_id, MAX(conversation) AS latest_message
             FROM user_conversations
             WHERE user_id = %s
             GROUP BY chat_id
             ORDER BY MAX(id) DESC
-        """, (current_user_id,))
+            """,
+            (current_user_id,)
+        )
         result = cursor.fetchall()
         chats = [{"chat_id": row[0], "latest_message": row[1]} for row in result]
         return {"chats": chats}
@@ -563,17 +520,19 @@ def get_user_chats(current_user_id: int = Depends(get_current_user)):
         cursor.close()
         connection.close()
 
-
 @app.get("/chat/history/{chat_id}", response_model=dict)
 def get_chat_history(chat_id: str, current_user_id: int = Depends(get_current_user)):
     connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
     try:
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT conversation FROM user_conversations 
             WHERE user_id = %s AND chat_id = %s 
             ORDER BY id ASC
-        """, (current_user_id, chat_id))
+            """,
+            (current_user_id, chat_id)
+        )
         result = cursor.fetchall()
         history = []
         for record in result:
@@ -583,7 +542,6 @@ def get_chat_history(chat_id: str, current_user_id: int = Depends(get_current_us
     finally:
         cursor.close()
         connection.close()
-
 
 @app.post("/register")
 def register_user(username: str = Form(...), password: str = Form(...)):
@@ -599,7 +557,6 @@ def register_user(username: str = Form(...), password: str = Form(...)):
     finally:
         cursor.close()
         connection.close()
-
 
 @app.post("/login")
 def login_for_access_token(username: str = Form(...), password: str = Form(...)):
@@ -618,11 +575,10 @@ def login_for_access_token(username: str = Form(...), password: str = Form(...))
         cursor.close()
         connection.close()
 
-
 @app.post("/workspaces")
 def create_workspace(
-        request: CreateWorkspaceRequest,
-        current_user=Depends(role_required(["admin", "superadmin"]))
+    request: CreateWorkspaceRequest,
+    current_user=Depends(role_required(["admin", "superadmin"]))
 ):
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
@@ -635,12 +591,11 @@ def create_workspace(
         cursor.close()
         connection.close()
 
-
 @app.post("/workspaces/{workspace_id}/assign-user")
 def assign_user_to_workspace(
-        workspace_id: int,
-        request: AssignUserRequest,
-        current_user=Depends(role_required(["admin", "superadmin"]))
+    workspace_id: int,
+    request: AssignUserRequest,
+    current_user=Depends(role_required(["admin", "superadmin"]))
 ):
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
@@ -655,13 +610,12 @@ def assign_user_to_workspace(
         cursor.close()
         connection.close()
 
-
 @app.post("/documents")
 def upload_document(
-        file: UploadFile = File(...),
-        scope: str = Form(...),
-        chat_id: Optional[str] = Form(None),
-        current_user=Depends(role_required(["user", "admin", "superadmin"]))
+    file: UploadFile = File(...),
+    scope: str = Form(...),
+    chat_id: Optional[str] = Form(None),
+    current_user=Depends(role_required(["user", "admin", "superadmin"]))
 ):
     if scope not in ["chat", "profile", "workspace", "system"]:
         raise HTTPException(status_code=400, detail="Invalid scope")
@@ -697,11 +651,10 @@ def upload_document(
 
     return {"message": f"Document uploaded successfully with scope {scope}"}
 
-
 @app.post("/chat", response_model=ChatResponse)
 def generate_response(
-        request: QueryRequest,
-        current_user=Depends(get_current_user_with_role)
+    request: QueryRequest,
+    current_user=Depends(get_current_user_with_role)
 ):
     """
     Main chat endpoint with multi-vector retrieval + optional graph expansions,
@@ -718,16 +671,18 @@ def generate_response(
             raise HTTPException(status_code=400, detail="chat_id is required when new_chat is False")
         chat_id = request.chat_id
 
-        # Fetch the entire conversation from DB
         connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
         cursor = connection.cursor()
         try:
-            cursor.execute("""
+            cursor.execute(
+                """
                 SELECT conversation 
                 FROM user_conversations 
                 WHERE user_id = %s AND chat_id = %s 
                 ORDER BY id ASC
-            """, (current_user["user_id"], chat_id))
+                """,
+                (current_user["user_id"], chat_id)
+            )
             rows = cursor.fetchall()
             conversation_so_far = "\n".join([r[0] for r in rows])
         except Exception as e:
@@ -736,20 +691,22 @@ def generate_response(
             cursor.close()
             connection.close()
 
-    # 2) Possibly summarize if conversation is too long
+    # 2) Possibly summarize
     maybe_summarize_long_conversation(current_user["user_id"], chat_id)
 
-    # Reload conversation if a summary was added
-    # (just to keep everything consistent)
+    # Reload if summary was added
     connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
     try:
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT conversation 
             FROM user_conversations 
             WHERE user_id = %s AND chat_id = %s 
             ORDER BY id ASC
-        """, (current_user["user_id"], chat_id))
+            """,
+            (current_user["user_id"], chat_id)
+        )
         rows = cursor.fetchall()
         conversation_so_far = "\n".join([r[0] for r in rows])
     finally:
@@ -760,10 +717,10 @@ def generate_response(
     refined_query = refine_query(request.query, conversation_so_far)
     print(f"Refined query: {refined_query}")
 
-    # 4) Retrieve docs using hybrid search + optional graph expansions
+    # 4) Retrieve docs
     docs = get_hybrid_plus_cypher_docs(refined_query, top_k=3, use_cypher_expansion=True)
 
-    # Build short context from retrieved docs
+    # Build short context
     context_text = ""
     for doc in docs:
         piece = f"{doc['content']}\n(Source: {doc['filename']})\n\n"
@@ -773,12 +730,11 @@ def generate_response(
             context_text += "... [truncated]"
             break
 
-    # If conversation is too large, we also truncate it
     truncated_conversation = conversation_so_far
     if len(truncated_conversation) > MAX_CONVERSATION_CHARS:
         truncated_conversation = truncated_conversation[:MAX_CONVERSATION_CHARS] + " ... [truncated]"
 
-    # 5) Construct prompt for LLM
+    # 5) Construct prompt
     prompt = f"""
         You are a helpful assistant who provides concise, step-by-step solutions.
         Conversation so far:
@@ -793,15 +749,15 @@ def generate_response(
         Your concise answer:
     """.strip()
 
-    # 6) Generate response
+    # 6) LLM response
     with llm_lock:
         response_text = llm.invoke(prompt).strip()
     response_text = response_text.encode('utf-8', errors='replace').decode('utf-8')
 
-    # 7) Save conversation turn
+    # 7) Save turn
     save_conversation(current_user["user_id"], chat_id, request.query, response_text)
 
-    # Return top doc filenames as "sources"
+    # Return doc filenames
     source_names = [doc['filename'] for doc in docs]
     sources_str = "\n".join(source_names)
     final_answer = f"{response_text}\n\nSources:\n{sources_str}"
@@ -811,7 +767,6 @@ def generate_response(
         "sources": ", ".join(source_names),
         "chat_id": chat_id
     }
-
 
 @app.post("/slack/events")
 async def slack_events(request: Request):
@@ -834,7 +789,6 @@ async def slack_events(request: Request):
 
     return JSONResponse(content={"message": "Event received"})
 
-
 @app.post("/slack/command")
 async def slack_command(request: Request, background_tasks: BackgroundTasks):
     if not await verify_slack_signature(request):
@@ -846,11 +800,10 @@ async def slack_command(request: Request, background_tasks: BackgroundTasks):
     background_tasks.add_task(process_slack_command, user_query, channel_id)
     return JSONResponse(content={"response_type": "ephemeral", "text": "Processing your request..."})
 
-
 @app.post("/update-role")
 def update_role(
-        request: UpdateRoleRequest,
-        current_user=Depends(role_required(["admin", "superadmin"]))
+    request: UpdateRoleRequest,
+    current_user=Depends(role_required(["admin", "superadmin"]))
 ):
     if request.new_role not in ["user", "admin", "superadmin"]:
         raise HTTPException(status_code=400, detail="Invalid role")
@@ -870,7 +823,6 @@ def update_role(
         cursor.close()
         connection.close()
 
-
 @app.get("/admin/users")
 def get_all_users(current_user=Depends(role_required(["superadmin"]))):
     connection = psycopg2.connect(**DB_CONFIG)
@@ -884,12 +836,11 @@ def get_all_users(current_user=Depends(role_required(["superadmin"]))):
         cursor.close()
         connection.close()
 
-
 @app.post("/admin/users/{user_id}/change-username")
 def change_username(
-        user_id: int,
-        new_username: str = Form(...),
-        current_user=Depends(role_required(["superadmin"]))
+    user_id: int,
+    new_username: str = Form(...),
+    current_user=Depends(role_required(["superadmin"]))
 ):
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
@@ -906,12 +857,11 @@ def change_username(
         cursor.close()
         connection.close()
 
-
 @app.post("/admin/users/{user_id}/change-password")
 def change_password(
-        user_id: int,
-        new_password: str = Form(...),
-        current_user=Depends(role_required(["superadmin"]))
+    user_id: int,
+    new_password: str = Form(...),
+    current_user=Depends(role_required(["superadmin"]))
 ):
     hashed_password = hashlib.sha256(new_password.encode()).hexdigest()
     connection = psycopg2.connect(**DB_CONFIG)
@@ -929,22 +879,24 @@ def change_password(
         cursor.close()
         connection.close()
 
-
 @app.get("/admin/users/{user_id}/chats")
 def get_user_chats_admin(
-        user_id: int,
-        current_user=Depends(role_required(["superadmin"]))
+    user_id: int,
+    current_user=Depends(role_required(["superadmin"]))
 ):
     connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
     try:
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT chat_id, MAX(conversation) AS latest_message
             FROM user_conversations
             WHERE user_id = %s
             GROUP BY chat_id
             ORDER BY MAX(id) DESC
-        """, (user_id,))
+            """,
+            (user_id,)
+        )
         result = cursor.fetchall()
         chats = [{"chat_id": row[0], "latest_message": row[1]} for row in result]
         return {"chats": chats}
@@ -952,37 +904,37 @@ def get_user_chats_admin(
         cursor.close()
         connection.close()
 
-
 @app.post("/embed-documents")
 def embed_documents(
-        directory: str = Form(...),
-        current_user=Depends(role_required(["admin", "superadmin"]))
+    directory: str = Form(...),
+    current_user=Depends(role_required(["admin", "superadmin"]))
 ):
     if not os.path.isdir(directory):
         raise HTTPException(status_code=400, detail="Invalid directory")
 
     try:
-        # This calls backend.process_documents which does chunking + embedding
         backend.process_documents(directory)
         return {"message": f"Documents in {directory} processed and embedded successfully."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.get("/workspaces/{user_id}/list")
 def get_user_workspaces(
-        user_id: int,
-        current_user=Depends(role_required(["admin", "superadmin"]))
+    user_id: int,
+    current_user=Depends(role_required(["admin", "superadmin"]))
 ):
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
     try:
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT w.id, w.name
             FROM workspaces w
             JOIN user_workspaces uw ON w.id = uw.workspace_id
             WHERE uw.user_id = %s
-        """, (user_id,))
+            """,
+            (user_id,)
+        )
         result = cursor.fetchall()
         workspaces = [{"workspace_id": row[0], "name": row[1]} for row in result]
         return {"workspaces": workspaces}
@@ -990,13 +942,165 @@ def get_user_workspaces(
         cursor.close()
         connection.close()
 
-
 @app.post("/configure-storage")
 def configure_storage(
-        storage_config: StorageConfig,
-        current_user=Depends(role_required(["superadmin"]))
+    storage_config: StorageConfig,
+    current_user=Depends(role_required(["superadmin"]))
 ):
     config_path = "storage_config.json"
     with open(config_path, "w") as f:
         json.dump(storage_config.dict(), f)
     return {"message": f"Storage configured successfully for {storage_config.datalake_type}"}
+
+@app.post("/local-datalake/upload-file")
+def local_datalake_upload_file(
+    file: UploadFile = File(...),
+    is_global: bool = Form(False),
+    workspace_id: Optional[int] = Form(None),
+    current_user=Depends(role_required(["admin", "superadmin"]))
+):
+    """
+    Endpoint to upload a file from the user's computer into the local datalake,
+    tag it with is_global or workspace_id, and embed it using backend's logic.
+    """
+
+    # 1) Read file into bytes
+    filename = file.filename
+    file_bytes = file.file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="File is empty or unreadable.")
+
+    # 2) Store in local datalake with metadata (is_global, workspace_id, etc.)
+    from storage_integrations import get_datalake
+    local_dlake = get_datalake("local")  # specifically want local
+
+    # We'll store uploaded files in "uploaded/" subfolder in local datalake
+    local_path = f"uploaded/{filename}"
+
+    # Create metadata
+    metadata = {
+        "filename": filename,
+        "uploaded_by": current_user["user_id"],
+        "is_global": is_global,
+        "workspace_id": workspace_id,
+        "uploaded_at": datetime.utcnow().isoformat()
+    }
+    # Save file + metadata
+    local_dlake.save_file_with_metadata(file_bytes, local_path, metadata)
+
+    # 3) Embed it by calling the existing logic in backend
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_filepath = os.path.join(tmpdir, filename)
+        # Write file bytes to a temporary file so we can reuse backend.read_file_content(...)
+        with open(temp_filepath, "wb") as f_out:
+            f_out.write(file_bytes)
+
+        # Extract text from the file
+        content = backend.read_file_content(temp_filepath)
+        if not content:
+            raise HTTPException(status_code=400, detail="Could not parse text from the file.")
+
+        # Split into chunks (using your existing chunk function)
+        chunks = backend.chunk_text_with_langchain(content, chunk_size=1000, chunk_overlap=200)
+
+        # Create base metadata for the Document nodes
+        file_level_meta = {
+            "filename": filename,
+            "is_global": is_global,
+            "workspace_id": workspace_id,
+            "size": len(file_bytes),
+            "word_count": len(content.split())
+        }
+
+        # We'll gather doc_ids + embeddings for doc-doc similarity
+        doc_ids = []
+        sem_embeddings = []
+
+        for ctext in chunks:
+            # This calls the same logic that:
+            #   - Summarizes chunk
+            #   - Creates doc node in Neo4j
+            #   - Possibly does entity extraction
+            #   - Stores embeddings in Milvus
+            doc_id = backend.process_chunk(ctext, file_level_meta)
+            doc_ids.append(doc_id)
+
+            # For doc-doc similarity, store the semantic embedding
+            sem_emb = backend.semantic_embedding_model.encode([ctext], show_progress_bar=False)[0]
+            sem_embeddings.append(sem_emb)
+
+        # Finally, link these new chunks to each other if they're similar
+        backend.compute_batch_similarities(doc_ids, sem_embeddings, threshold=0.7)
+
+    return {
+        "message": f"File '{filename}' uploaded and embedded successfully.",
+        "is_global": is_global,
+        "workspace_id": workspace_id,
+        "local_path": local_path
+    }
+
+# ----------------------------------------------------------------------------
+# NEW ENDPOINTS (do not modify anything above)
+# ----------------------------------------------------------------------------
+from fastapi import Form
+
+@app.post("/admin/copy-google-drive-to-local")
+def copy_google_drive_to_local(
+    folder_id: str = Form(...),
+    is_global: bool = Form(False),
+    current_user=Depends(role_required(["superadmin"]))
+):
+    """
+    Copy files from Google Drive into the local datalake folder,
+    then set is_global in their metadata.
+    We call integrate_data_into_datalake("google_drive", "local", folder_id=...),
+    then update .metadata.json files to reflect is_global.
+    """
+    try:
+        integrate_data_into_datalake(
+            provider="google_drive",
+            datalake_type="local",
+            folder_id=folder_id
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    base_path = os.environ.get("LOCAL_DATALAKE_PATH", "local_datalake")
+    google_drive_dir = os.path.join(base_path, "google_drive")
+
+    for root, dirs, files in os.walk(google_drive_dir):
+        for filename in files:
+            if filename.endswith(".metadata.json"):
+                meta_path = os.path.join(root, filename)
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        metadata = json.load(f)
+                    metadata["is_global"] = is_global
+                    with open(meta_path, "w", encoding="utf-8") as f:
+                        json.dump(metadata, f, ensure_ascii=False, indent=2)
+                except Exception as ex:
+                    print(f"Could not update metadata file {meta_path}: {ex}")
+
+    return {
+        "message": "Successfully copied files from Google Drive to local datalake",
+        "is_global": is_global
+    }
+
+@app.post("/admin/configure-storage-dashboard")
+def configure_storage_dashboard(
+    datalake_type: str = Form(...),
+    current_user=Depends(role_required(["superadmin"]))
+):
+    """
+    Minimal wrapper around /configure-storage for a simpler Admin UI
+    that only sets the datalake type and leaves config empty or default.
+    """
+    dummy_config = {}
+    payload = StorageConfig(datalake_type=datalake_type, config=dummy_config)
+
+    config_path = "storage_config.json"
+    with open(config_path, "w") as f:
+        json.dump(payload.dict(), f)
+
+    return {"message": f"Storage configured successfully for {datalake_type}"}
