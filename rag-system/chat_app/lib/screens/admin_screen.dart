@@ -21,6 +21,14 @@ class _AdminScreenState extends State<AdminScreen> {
   final TextEditingController newUsernameController = TextEditingController();
   final TextEditingController newPasswordController = TextEditingController();
 
+  // NEW: For Google Drive and storage config
+  final TextEditingController gdriveFolderIdController = TextEditingController();
+  String selectedDatalakeType = "local"; // default
+  bool isGlobal = false;                // for the "Copy" step
+
+  // NEW: For the local datalake upload (optional workspace ID)
+  final TextEditingController localDatalakeWorkspaceIdController = TextEditingController();
+
   // Variables
   String selectedRole = "user";
   String selectedScope = "chat";
@@ -141,6 +149,7 @@ class _AdminScreenState extends State<AdminScreen> {
     }
   }
 
+  // Existing "uploadDocument" for /documents
   Future<void> uploadDocument() async {
     try {
       if (filePathController.text.isEmpty) {
@@ -160,6 +169,7 @@ class _AdminScreenState extends State<AdminScreen> {
     }
   }
 
+  // Existing pickFile
   Future<void> pickFile() async {
     FilePickerResult? result = await FilePicker.platform.pickFiles();
     if (result != null) {
@@ -183,6 +193,71 @@ class _AdminScreenState extends State<AdminScreen> {
     } catch (e) {
       setState(() {
         statusMessage = "Error embedding documents: $e";
+      });
+    }
+  }
+
+  // Copy from GDrive to Local
+  Future<void> copyFromGDriveToLocal() async {
+    final folderId = gdriveFolderIdController.text.trim();
+    if (folderId.isEmpty) {
+      setState(() {
+        statusMessage = "Folder ID cannot be empty.";
+      });
+      return;
+    }
+    try {
+      final result = await apiService.copyGoogleDriveToLocal(folderId, isGlobal);
+      setState(() {
+        statusMessage = result["message"];
+      });
+    } catch (e) {
+      setState(() {
+        statusMessage = "Error copying from Google Drive: $e";
+      });
+    }
+  }
+
+  // Configure Storage
+  Future<void> doConfigureStorage() async {
+    try {
+      final result = await apiService.configureStorageDashboard(selectedDatalakeType);
+      setState(() {
+        statusMessage = result["message"];
+      });
+    } catch (e) {
+      setState(() {
+        statusMessage = "Error configuring storage: $e";
+      });
+    }
+  }
+
+  // NEW: Upload & Embed file to local datalake
+  Future<void> uploadFileToLocalDatalake() async {
+    if (filePathController.text.isEmpty) {
+      setState(() {
+        statusMessage = "No file selected for local datalake upload.";
+      });
+      return;
+    }
+
+    int? workspaceId;
+    if (localDatalakeWorkspaceIdController.text.trim().isNotEmpty) {
+      workspaceId = int.tryParse(localDatalakeWorkspaceIdController.text.trim());
+    }
+
+    try {
+      final result = await apiService.uploadFileToLocalDatalake(
+        filePathController.text,
+        isGlobal,
+        workspaceId: workspaceId,
+      );
+      setState(() {
+        statusMessage = "Local datalake upload success: ${result['message']}";
+      });
+    } catch (e) {
+      setState(() {
+        statusMessage = "Error uploading file to local datalake: $e";
       });
     }
   }
@@ -211,6 +286,7 @@ class _AdminScreenState extends State<AdminScreen> {
                 padding: const EdgeInsets.only(bottom: 20),
                 child: Text(statusMessage, style: TextStyle(fontSize: 16, color: Colors.blue)),
               ),
+
             // Workspace Management
             Card(
               child: Padding(
@@ -263,6 +339,7 @@ class _AdminScreenState extends State<AdminScreen> {
                 ),
               ),
             ),
+
             // User Management
             if (role == "superadmin" && allUsers.isNotEmpty)
               Card(
@@ -297,7 +374,9 @@ class _AdminScreenState extends State<AdminScreen> {
                                                   decoration: InputDecoration(labelText: "New Username"),
                                                 ),
                                                 actions: [
-                                                  TextButton(onPressed: () => Navigator.pop(context), child: Text("Cancel")),
+                                                  TextButton(
+                                                      onPressed: () => Navigator.pop(context),
+                                                      child: Text("Cancel")),
                                                   ElevatedButton(
                                                     onPressed: () {
                                                       Navigator.pop(context);
@@ -326,7 +405,9 @@ class _AdminScreenState extends State<AdminScreen> {
                                                   obscureText: true,
                                                 ),
                                                 actions: [
-                                                  TextButton(onPressed: () => Navigator.pop(context), child: Text("Cancel")),
+                                                  TextButton(
+                                                      onPressed: () => Navigator.pop(context),
+                                                      child: Text("Cancel")),
                                                   ElevatedButton(
                                                     onPressed: () {
                                                       Navigator.pop(context);
@@ -372,6 +453,7 @@ class _AdminScreenState extends State<AdminScreen> {
                   ),
                 ),
               ),
+
             // Embed Documents
             if (role == "superadmin")
               Card(
@@ -394,6 +476,152 @@ class _AdminScreenState extends State<AdminScreen> {
                         onPressed: embedDocuments,
                         style: ElevatedButton.styleFrom(backgroundColor: Colors.pink),
                         child: Text("Start Embedding"),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+
+            // STORAGE INTEGRATION CARD
+            if (role == "superadmin")
+              Card(
+                child: Padding(
+                  padding: EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        "Storage Integration Settings",
+                        style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                      ),
+                      SizedBox(height: 10),
+
+                      Text("Select Datalake Type:"),
+                      DropdownButton<String>(
+                        value: selectedDatalakeType,
+                        items: <String>["local", "s3", "azureblob", "minio"].map((String value) {
+                          return DropdownMenuItem<String>(
+                            value: value,
+                            child: Text(value),
+                          );
+                        }).toList(),
+                        onChanged: (val) {
+                          if (val != null) {
+                            setState(() {
+                              selectedDatalakeType = val;
+                            });
+                          }
+                        },
+                      ),
+                      SizedBox(height: 10),
+
+                      ElevatedButton(
+                        onPressed: doConfigureStorage,
+                        style: ElevatedButton.styleFrom(backgroundColor: Colors.pink),
+                        child: Text("Configure Storage"),
+                      ),
+
+                      Divider(height: 30),
+
+                      Text("Copy Files from Google Drive to Local"),
+                      SizedBox(height: 10),
+                      TextField(
+                        controller: gdriveFolderIdController,
+                        decoration: InputDecoration(
+                          labelText: "Google Drive Folder ID",
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      SizedBox(height: 10),
+                      Row(
+                        children: [
+                          Text("is_global?"),
+                          Switch(
+                            value: isGlobal,
+                            onChanged: (val) {
+                              setState(() {
+                                isGlobal = val;
+                              });
+                            },
+                          ),
+                        ],
+                      ),
+                      SizedBox(height: 10),
+                      ElevatedButton(
+                        onPressed: copyFromGDriveToLocal,
+                        style: ElevatedButton.styleFrom(backgroundColor: Colors.pink),
+                        child: Text("Copy to Local"),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+
+            // -----------------------------------
+            // NEW CARD: Upload & Embed into Local Datalake
+            // -----------------------------------
+            if (role == "superadmin" || role == "admin")
+              Card(
+                child: Padding(
+                  padding: EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        "Upload & Embed File to Local Datalake",
+                        style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                      ),
+                      SizedBox(height: 10),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: TextField(
+                              controller: filePathController,
+                              readOnly: true,
+                              decoration: InputDecoration(
+                                labelText: "File Path",
+                                border: OutlineInputBorder(),
+                              ),
+                            ),
+                          ),
+                          SizedBox(width: 10),
+                          ElevatedButton(
+                            onPressed: pickFile,
+                            child: Text("Browse"),
+                          ),
+                        ],
+                      ),
+                      SizedBox(height: 10),
+
+                      Row(
+                        children: [
+                          Text("is_global?"),
+                          Switch(
+                            value: isGlobal,
+                            onChanged: (val) {
+                              setState(() {
+                                isGlobal = val;
+                              });
+                            },
+                          ),
+                        ],
+                      ),
+                      SizedBox(height: 10),
+
+                      TextField(
+                        controller: localDatalakeWorkspaceIdController,
+                        decoration: InputDecoration(
+                          labelText: "Workspace ID (optional)",
+                          border: OutlineInputBorder(),
+                        ),
+                        keyboardType: TextInputType.number,
+                      ),
+                      SizedBox(height: 10),
+
+                      ElevatedButton(
+                        onPressed: uploadFileToLocalDatalake,
+                        style: ElevatedButton.styleFrom(backgroundColor: Colors.pink),
+                        child: Text("Upload & Embed"),
                       ),
                     ],
                   ),

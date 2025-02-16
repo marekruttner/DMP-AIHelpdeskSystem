@@ -99,7 +99,7 @@ def init_milvus_collection(
             FieldSchema(
                 name="embedding",
                 dtype=DataType.FLOAT_VECTOR,
-                dim=384
+                dim=1024
             ),
         ]
         schema = CollectionSchema(fields, description="Document Embeddings")
@@ -142,7 +142,7 @@ def init_neo4j(
     driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
     logger.info(f"Connected to Neo4j at {neo4j_uri}")
 
-def init_embedding_model(model_name="sentence-transformers/all-MiniLM-L6-v2"):
+def init_embedding_model(model_name="intfloat/e5-large-v2"):
     """
     Initializes a Sentence-BERT or similar model from the sentence-transformers library.
     """
@@ -216,7 +216,10 @@ def create_document_node(doc_id, content, metadata):
 def _create_relationship_tx(tx, doc_id_1, doc_id_2, relationship_type, extra_data):
     tx.run(
         """
-        MATCH (d1:Document {doc_id: $doc_id_1}), (d2:Document {doc_id: $doc_id_2})
+        MATCH (d1:Document {doc_id: $doc_id_1})
+        WITH d1
+        MATCH (d2:Document {doc_id: $doc_id_2})
+        WHERE d1 <> d2
         CREATE (d1)-[:RELATED {type: $relationship_type, extra: $extra_data}]->(d2)
         """,
         doc_id_1=doc_id_1,
