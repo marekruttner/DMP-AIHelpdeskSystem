@@ -297,8 +297,6 @@ def maybe_summarize_long_conversation(user_id: int, chat_id: str):
                 """,
                 (user_id, chat_id, f"AI (conversation summary): {summary}")
             )
-            # Optionally delete older entries or keep them
-            # For now, let's just keep them.
             connection.commit()
             return True
         return False
@@ -309,7 +307,7 @@ def maybe_summarize_long_conversation(user_id: int, chat_id: str):
         connection.close()
 
 ################################################################################
-# Multi-Vector + Graph Retrieval
+# Multi-Vector + Graph Retrieval (existing retrieval)
 ################################################################################
 
 def hybrid_search(query: str, top_k: int = 5) -> list:
@@ -320,12 +318,10 @@ def hybrid_search(query: str, top_k: int = 5) -> list:
     3) Merge results (by average or max of similarity)
     4) Return top_k doc_ids
     """
-    # Step 1: embed query in both models
     with model_lock:
         sem_emb = backend.semantic_embedding_model.encode([query], show_progress_bar=False)[0].astype(np.float32)
         lex_emb = backend.lexical_embedding_model.encode([query], show_progress_bar=False)[0].astype(np.float32)
 
-    # Step 2: do Milvus searches
     sem_search_params = {"metric_type": "COSINE", "params": {"ef": 64}}
     lex_search_params = {"metric_type": "COSINE", "params": {"ef": 64}}
 
@@ -345,7 +341,6 @@ def hybrid_search(query: str, top_k: int = 5) -> list:
         output_fields=["document_id"]
     )[0]
 
-    # Step 3: unify and rank
     score_map = {}
 
     for hit in sem_results:
@@ -393,10 +388,6 @@ def generate_cypher_query(refined_query: str) -> str:
     return possible_cypher
 
 def run_cypher_query(query_text: str, top_k: int = 5) -> list:
-    """
-    Attempts to run a given Cypher query, expecting it to return a list of doc_ids
-    from Document nodes. We'll parse them out.
-    """
     doc_ids = []
     with backend.driver.session() as session:
         try:
@@ -414,12 +405,8 @@ def run_cypher_query(query_text: str, top_k: int = 5) -> list:
     return doc_ids[:top_k]
 
 def retrieve_docs_from_neo4j(doc_ids: list) -> list:
-    """
-    Given a list of doc_ids, fetch their content and metadata from Neo4j.
-    """
     if not doc_ids:
         return []
-
     with backend.driver.session() as session:
         result = session.run(
             """
@@ -439,14 +426,9 @@ def retrieve_docs_from_neo4j(doc_ids: list) -> list:
     return documents
 
 def get_hybrid_plus_cypher_docs(refined_query: str, top_k: int = 5, use_cypher_expansion: bool = True) -> list:
-    """
-    1. Multi-vector search in Milvus
-    2. (Optional) Generate a Cypher query to find relevant docs in Neo4j
-    3. Merge doc_ids, retrieve content from Neo4j
-    """
     doc_ids_hybrid = hybrid_search(refined_query, top_k=top_k)
-
     doc_ids_cypher = []
+
     if use_cypher_expansion:
         possible_cypher = generate_cypher_query(refined_query)
         doc_ids_cypher = run_cypher_query(possible_cypher, top_k=top_k)
@@ -461,7 +443,7 @@ def get_hybrid_plus_cypher_docs(refined_query: str, top_k: int = 5, use_cypher_e
 
 async def verify_slack_signature(request: Request):
     timestamp = request.headers.get("X-Slack-Request-Timestamp")
-    if abs(int(timestamp) - int(datetime.now().timestamp())) > 60 * 5:
+    if abs(int(timestamp) - int(datetime.now().timestamp()) ) > 60 * 5:
         return False
 
     request_body = await request.body()
@@ -495,7 +477,7 @@ def get_storage_settings():
         return json.load(f)
 
 ################################################################################
-# Existing Endpoints
+# Existing Endpoints (unchanged)
 ################################################################################
 
 @app.get("/chats", response_model=dict)
@@ -651,14 +633,147 @@ def upload_document(
 
     return {"message": f"Document uploaded successfully with scope {scope}"}
 
+###############################################################################
+# NEW: LevelRAG Helper Functions
+###############################################################################
+
+def decompose_query(original_query: str) -> list:
+    """
+    Prompt an LLM to break down the user query into simpler sub-queries if multi-hop.
+    Return a list of sub-queries. If single-hop, it might just return one.
+    """
+    prompt_decompose = f"""
+    You are a query decomposer. The user asked: "{original_query}"
+    If the question is complex or multi-hop, decompose it into multiple sub-questions.
+    If it is single-hop, just return one line.
+    Return each sub-question on a new line, with no other explanation.
+    """
+
+    with llm_lock:
+        raw_result = llm.invoke(prompt_decompose).strip()
+
+    subqueries = [line.strip() for line in raw_result.split("\n") if line.strip()]
+    return subqueries
+
+def summarize_docs_for_subquery(subquery: str, docs: list) -> str:
+    """
+    Summarize the retrieved docs in a short text that answers the subquery.
+    Keep it concise: 1-2 sentences.
+    """
+    # Combine doc text (watch out for length)
+    combined_text = ""
+    for d in docs:
+        piece = d["content"] + "\n"
+        if len(combined_text + piece) < 1500:
+            combined_text += piece
+        else:
+            break
+
+    prompt_summarize = f"""
+    You are a helpful assistant. 
+    Sub-question: {subquery}
+    Context:
+    {combined_text}
+
+    Please provide a short, direct answer (1-2 sentences) about the sub-question:
+    """
+
+    with llm_lock:
+        summary = llm.invoke(prompt_summarize).strip()
+
+    return summary
+
+def verify_completeness(original_query: str, partial_answers: list) -> bool:
+    """
+    Check if partial answers so far appear sufficient to answer the overall question.
+    Return True/False.
+    """
+    partial_joined = "\n".join(partial_answers)
+    prompt_verify = f"""
+    The user asked: "{original_query}"
+    Partial answers so far:
+    {partial_joined}
+
+    Are these partial answers collectively enough to confidently answer the question?
+    Reply "yes" or "no".
+    """
+    with llm_lock:
+        verdict = llm.invoke(prompt_verify).strip().lower()
+
+    return "yes" in verdict
+
+def supplement_subqueries(original_query: str, partial_answers: list) -> list:
+    """
+    If partial answers are not enough, ask the LLM what additional sub-questions are needed.
+    If none, return empty list. Otherwise, return new sub-queries.
+    """
+    partial_joined = "\n".join(partial_answers)
+    prompt_supplement = f"""
+    The user asked: "{original_query}"
+    Partial answers so far:
+    {partial_joined}
+
+    What other sub-questions should we ask to fill any missing info?
+    If none needed, say "No additional information is required".
+    Otherwise, list new sub-questions, one per line.
+    """
+    with llm_lock:
+        raw = llm.invoke(prompt_supplement).strip()
+
+    if "No additional information is required" in raw:
+        return []
+    new_subqs = [line.strip() for line in raw.split("\n") if line.strip()]
+    return new_subqs
+
+def high_level_levelrag_search(original_query: str, max_rounds=3, top_k=3) -> (str, list):
+    """
+    Full hierarchical retrieval:
+      1) Decompose
+      2) Retrieve + summarize
+      3) Verify completeness; if incomplete, supplement
+      4) Return final partial context + doc filenames
+    """
+    subqueries = decompose_query(original_query)
+    partial_answers = []
+    doc_filenames = []
+    rounds = 0
+
+    while rounds < max_rounds and subqueries:
+        rounds += 1
+        new_answers = []
+
+        for sq in subqueries:
+            docs = get_hybrid_plus_cypher_docs(sq, top_k=top_k, use_cypher_expansion=True)
+            summary = summarize_docs_for_subquery(sq, docs)
+            new_answers.append(summary)
+            fnames = [doc["filename"] for doc in docs]
+            doc_filenames.extend(fnames)
+
+        partial_answers.extend(new_answers)
+
+        if verify_completeness(original_query, partial_answers):
+            break
+        else:
+            # supplement
+            next_subqs = supplement_subqueries(original_query, partial_answers)
+            if not next_subqs:
+                break
+            subqueries = next_subqs
+
+    # Combine partial answers as final context:
+    final_context = "\n".join(partial_answers)
+    return final_context, doc_filenames
+
+###############################################################################
+# Modified /chat Endpoint with LevelRAG logic
+###############################################################################
 @app.post("/chat", response_model=ChatResponse)
 def generate_response(
     request: QueryRequest,
     current_user=Depends(get_current_user_with_role)
 ):
     """
-    Main chat endpoint with multi-vector retrieval + optional graph expansions,
-    conversation summarization, and query refinement.
+    Main chat endpoint with hierarchical (LevelRAG) retrieval logic.
     """
     print(f"Request received: {request.dict()}")
 
@@ -691,10 +806,10 @@ def generate_response(
             cursor.close()
             connection.close()
 
-    # 2) Possibly summarize
+    # 2) Summarize if too long
     maybe_summarize_long_conversation(current_user["user_id"], chat_id)
 
-    # Reload if summary was added
+    # Reload updated conversation if needed
     connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
     try:
@@ -713,61 +828,58 @@ def generate_response(
         cursor.close()
         connection.close()
 
-    # 3) Refine query
-    refined_query = refine_query(request.query, conversation_so_far)
-    print(f"Refined query: {refined_query}")
+    # We'll do a simpler approach: skip refine_query or do it if you want
+    # refined_query = refine_query(request.query, conversation_so_far)
+    # Or just use the user query directly
 
-    # 4) Retrieve docs
-    docs = get_hybrid_plus_cypher_docs(refined_query, top_k=3, use_cypher_expansion=True)
+    user_question = request.query
 
-    # Build short context
-    context_text = ""
-    for doc in docs:
-        piece = f"{doc['content']}\n(Source: {doc['filename']})\n\n"
-        if len(context_text + piece) < MAX_CONTEXT_CHARS:
-            context_text += piece
-        else:
-            context_text += "... [truncated]"
-            break
+    # 3) High-level multi-hop retrieval
+    final_partial_context, doc_filenames = high_level_levelrag_search(
+        original_query=user_question,
+        max_rounds=3,
+        top_k=3
+    )
 
+    # 4) Combine partial context + conversation for final LLM
     truncated_conversation = conversation_so_far
     if len(truncated_conversation) > MAX_CONVERSATION_CHARS:
         truncated_conversation = truncated_conversation[:MAX_CONVERSATION_CHARS] + " ... [truncated]"
 
-    # 5) Construct prompt
-    prompt = f"""
-        You are a helpful assistant who provides concise, step-by-step solutions.
+    final_prompt = f"""
+        You are a helpful assistant. 
         Conversation so far:
         {truncated_conversation}
 
-        Relevant context:
-        {context_text}
+        Partial Summaries from sub-queries:
+        {final_partial_context}
 
-        Question:
-        {request.query}
+        Now provide a final coherent answer to the user's question:
+        {user_question}
 
-        Your concise answer:
+        Answer concisely:
     """.strip()
 
-    # 6) LLM response
     with llm_lock:
-        response_text = llm.invoke(prompt).strip()
+        response_text = llm.invoke(final_prompt).strip()
     response_text = response_text.encode('utf-8', errors='replace').decode('utf-8')
 
-    # 7) Save turn
-    save_conversation(current_user["user_id"], chat_id, request.query, response_text)
+    # 5) Save conversation turn
+    save_conversation(current_user["user_id"], chat_id, user_question, response_text)
 
-    # Return doc filenames
-    source_names = [doc['filename'] for doc in docs]
-    sources_str = "\n".join(source_names)
+    # 6) Return doc filenames
+    sources_str = "\n".join(doc_filenames)
     final_answer = f"{response_text}\n\nSources:\n{sources_str}"
 
     return {
         "response": final_answer,
-        "sources": ", ".join(source_names),
+        "sources": ", ".join(doc_filenames),
         "chat_id": chat_id
     }
 
+###############################################################################
+# Slack endpoints remain unchanged
+###############################################################################
 @app.post("/slack/events")
 async def slack_events(request: Request):
     if not await verify_slack_signature(request):
@@ -992,19 +1104,15 @@ def local_datalake_upload_file(
     import tempfile
     with tempfile.TemporaryDirectory() as tmpdir:
         temp_filepath = os.path.join(tmpdir, filename)
-        # Write file bytes to a temporary file so we can reuse backend.read_file_content(...)
         with open(temp_filepath, "wb") as f_out:
             f_out.write(file_bytes)
 
-        # Extract text from the file
         content = backend.read_file_content(temp_filepath)
         if not content:
             raise HTTPException(status_code=400, detail="Could not parse text from the file.")
 
-        # Split into chunks (using your existing chunk function)
         chunks = backend.chunk_text_with_langchain(content, chunk_size=1000, chunk_overlap=200)
 
-        # Create base metadata for the Document nodes
         file_level_meta = {
             "filename": filename,
             "is_global": is_global,
@@ -1013,24 +1121,15 @@ def local_datalake_upload_file(
             "word_count": len(content.split())
         }
 
-        # We'll gather doc_ids + embeddings for doc-doc similarity
         doc_ids = []
         sem_embeddings = []
-
         for ctext in chunks:
-            # This calls the same logic that:
-            #   - Summarizes chunk
-            #   - Creates doc node in Neo4j
-            #   - Possibly does entity extraction
-            #   - Stores embeddings in Milvus
             doc_id = backend.process_chunk(ctext, file_level_meta)
             doc_ids.append(doc_id)
 
-            # For doc-doc similarity, store the semantic embedding
             sem_emb = backend.semantic_embedding_model.encode([ctext], show_progress_bar=False)[0]
             sem_embeddings.append(sem_emb)
 
-        # Finally, link these new chunks to each other if they're similar
         backend.compute_batch_similarities(doc_ids, sem_embeddings, threshold=0.7)
 
     return {
