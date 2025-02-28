@@ -38,8 +38,7 @@ class ApiService {
     final response = await http.post(
       Uri.parse('$baseUrl/login'),
       headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body:
-      'username=${Uri.encodeQueryComponent(username)}&password=${Uri.encodeQueryComponent(password)}',
+      body: 'username=${Uri.encodeQueryComponent(username)}&password=${Uri.encodeQueryComponent(password)}',
     );
 
     if (response.statusCode == 200) {
@@ -58,8 +57,7 @@ class ApiService {
     final response = await http.post(
       Uri.parse('$baseUrl/register'),
       headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body:
-      'username=${Uri.encodeQueryComponent(username)}&password=${Uri.encodeQueryComponent(password)}',
+      body: 'username=${Uri.encodeQueryComponent(username)}&password=${Uri.encodeQueryComponent(password)}',
     );
 
     if (response.statusCode == 200) {
@@ -71,8 +69,7 @@ class ApiService {
   }
 
   Future<List<dynamic>> getChats() async {
-    final response =
-    await http.get(Uri.parse('$baseUrl/chats'), headers: authHeaders);
+    final response = await http.get(Uri.parse('$baseUrl/chats'), headers: authHeaders);
     if (response.statusCode == 200) {
       final data = json.decode(utf8.decode(response.bodyBytes));
       return data['chats'] ?? [];
@@ -93,8 +90,7 @@ class ApiService {
     }
   }
 
-  Future<Map<String, dynamic>> chat(String query,
-      {required bool newChat, String? chatId}) async {
+  Future<Map<String, dynamic>> chat(String query, {required bool newChat, String? chatId}) async {
     final body = {'query': query, 'new_chat': newChat};
     if (chatId != null) body['chat_id'] = chatId;
 
@@ -114,11 +110,39 @@ class ApiService {
     }
   }
 
-  // Admin & Documents
+  // -------------------------------------------------------------------------
+  // Rate an AI response
+  // -------------------------------------------------------------------------
+  Future<void> rateResponse(String chatId, int rating, {String? comment}) async {
+    final uri = Uri.parse('$baseUrl/rate_response');
+    final payload = {
+      "chat_id": chatId,
+      "rating": rating,
+    };
+    if (comment != null && comment.isNotEmpty) {
+      payload["comment"] = comment;
+    }
 
+    final response = await http.post(
+      uri,
+      headers: {
+        ...authHeaders,
+        'Content-Type': 'application/json',
+      },
+      body: json.encode(payload),
+    );
+
+    if (response.statusCode != 200) {
+      final errorData = json.decode(utf8.decode(response.bodyBytes));
+      throw Exception(errorData['detail'] ?? 'Failed to rate response');
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Admin & Documents
+  // -------------------------------------------------------------------------
   Future<List<dynamic>> getAllUsers() async {
-    final response =
-    await http.get(Uri.parse('$baseUrl/admin/users'), headers: authHeaders);
+    final response = await http.get(Uri.parse('$baseUrl/admin/users'), headers: authHeaders);
     if (response.statusCode == 200) {
       final data = json.decode(utf8.decode(response.bodyBytes));
       return data['users'] ?? [];
@@ -189,8 +213,7 @@ class ApiService {
     }
   }
 
-  Future<Map<String, dynamic>> assignUserToWorkspace(
-      int workspaceId, int userId) async {
+  Future<Map<String, dynamic>> assignUserToWorkspace(int workspaceId, int userId) async {
     final payload = {"user_id": userId};
     final response = await http.post(
       Uri.parse('$baseUrl/workspaces/$workspaceId/assign-user'),
@@ -239,8 +262,7 @@ class ApiService {
     }
   }
 
-  Future<Map<String, dynamic>> uploadDocument(String filePath, String scope,
-      {String? chatId}) async {
+  Future<Map<String, dynamic>> uploadDocument(String filePath, String scope, {String? chatId}) async {
     var request = http.MultipartRequest(
       'POST',
       Uri.parse('$baseUrl/documents'),
@@ -281,7 +303,7 @@ class ApiService {
   }
 
   // -------------------------------------------------------------------------
-  // NEW METHODS for copying from GDrive to local and configuring storage
+  // Copy from GDrive -> local, configure storage, etc.
   // -------------------------------------------------------------------------
   Future<Map<String, dynamic>> copyGoogleDriveToLocal(String folderId, bool isGlobal) async {
     final uri = Uri.parse('$baseUrl/admin/copy-google-drive-to-local');
@@ -320,9 +342,6 @@ class ApiService {
     }
   }
 
-  // -------------------------------------------------------------------------
-  // NEW METHOD to upload & embed a file to local datalake
-  // -------------------------------------------------------------------------
   Future<Map<String, dynamic>> uploadFileToLocalDatalake(
       String filePath,
       bool isGlobal, {
@@ -331,19 +350,15 @@ class ApiService {
     final uri = Uri.parse('$baseUrl/local-datalake/upload-file');
     final request = http.MultipartRequest('POST', uri);
 
-    // Add auth header
     request.headers.addAll(authHeaders);
 
-    // Attach file
     request.files.add(await http.MultipartFile.fromPath('file', filePath));
 
-    // Fields: is_global and optionally workspace_id
     request.fields['is_global'] = isGlobal.toString();
     if (workspaceId != null) {
       request.fields['workspace_id'] = workspaceId.toString();
     }
 
-    // Send request
     final streamedResponse = await request.send();
     final response = await http.Response.fromStream(streamedResponse);
 
@@ -351,9 +366,7 @@ class ApiService {
       return json.decode(utf8.decode(response.bodyBytes));
     } else {
       final errorData = json.decode(utf8.decode(response.bodyBytes));
-      throw Exception(
-        errorData['detail'] ?? 'Failed to upload file to local datalake.',
-      );
+      throw Exception(errorData['detail'] ?? 'Failed to upload file to local datalake.');
     }
   }
 }
