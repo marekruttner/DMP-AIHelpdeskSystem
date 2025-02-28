@@ -9,7 +9,7 @@ from google.oauth2.credentials import Credentials as GoogleCredentials
 from googleapiclient.discovery import build
 from msal import ConfidentialClientApplication
 from abc import ABC, abstractmethod
-from azure.storage.blob import BlobServiceClient
+from azure.storage.blob import BlobServiceClient, ContentSettings
 
 # Base Datalake Interface
 class DataLake(ABC):
@@ -111,20 +111,34 @@ class AzureBlobDataLake(DataLake):
         self.connection_string = os.environ.get("AZURE_BLOB_CONNECTION_STRING")
         self.container_name = os.environ.get("AZURE_BLOB_CONTAINER", "my-datalake-container")
         self.service_client = BlobServiceClient.from_connection_string(self.connection_string)
+        self.container_client = self.service_client.get_container_client(self.container_name)
+
+        # Ensure the container exists
+        if not self.container_client.exists():
+            self.container_client.create_container()
 
     def save_file_with_metadata(self, file_content: bytes, file_path: str, metadata: dict):
-        blob_client = self.service_client.get_blob_client(container=self.container_name, blob=file_path)
-        blob_client.upload_blob(file_content, overwrite=True, metadata=metadata)
+        blob_client = self.container_client.get_blob_client(blob=file_path)
+        blob_client.upload_blob(
+            file_content,
+            overwrite=True,
+            metadata={k: str(v) for k, v in metadata.items() if isinstance(v, (str, int, float))},
+            content_settings=ContentSettings(content_type="application/octet-stream")
+        )
 
+        # Save metadata as a separate file
         meta_path = file_path + ".metadata.json"
-        meta_blob_client = self.service_client.get_blob_client(container=self.container_name, blob=meta_path)
-        meta_blob_client.upload_blob(json.dumps(metadata).encode('utf-8'), overwrite=True)
+        meta_blob_client = self.container_client.get_blob_client(blob=meta_path)
+        meta_blob_client.upload_blob(
+            json.dumps(metadata).encode('utf-8'),
+            overwrite=True,
+            content_settings=ContentSettings(content_type="application/json")
+        )
 
     def load_file(self, file_path: str) -> bytes:
-        blob_client = self.service_client.get_blob_client(container=self.container_name, blob=file_path)
+        blob_client = self.container_client.get_blob_client(blob=file_path)
         downloader = blob_client.download_blob()
         return downloader.readall()
-
 
 def get_datalake(datalake_type: str) -> DataLake:
     """
