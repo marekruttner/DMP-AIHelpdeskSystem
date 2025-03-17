@@ -10,7 +10,7 @@ from fastapi.security import OAuth2PasswordBearer
 from fastapi.responses import JSONResponse
 from fastapi.background import BackgroundTasks
 from pydantic import BaseModel
-from typing import Optional, Union
+from typing import Optional, Union, List
 import uuid
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
@@ -34,6 +34,17 @@ try:
     conversation_summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
 except:
     conversation_summarizer = None
+
+# Evaluate library for text metrics
+import evaluate
+import math
+
+# TensorBoard
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_AVAILABLE = True
+except ImportError:
+    TENSORBOARD_AVAILABLE = False
 
 # FastAPI app initialization
 app = FastAPI()
@@ -90,7 +101,7 @@ backend.initialize_all(
 )
 
 # Initialize LLM (you can choose any model in Ollama)
-llm = Ollama(model="llama3.1:8b")
+llm = Ollama(model="phi4:latest")
 
 ################################################################################
 # Configurable Constants
@@ -297,8 +308,6 @@ def maybe_summarize_long_conversation(user_id: int, chat_id: str):
                 """,
                 (user_id, chat_id, f"AI (conversation summary): {summary}")
             )
-            # Optionally delete older entries or keep them
-            # For now, let's just keep them.
             connection.commit()
             return True
         return False
@@ -461,7 +470,7 @@ def get_hybrid_plus_cypher_docs(refined_query: str, top_k: int = 5, use_cypher_e
 
 async def verify_slack_signature(request: Request):
     timestamp = request.headers.get("X-Slack-Request-Timestamp")
-    if abs(int(timestamp) - int(datetime.now().timestamp())) > 60 * 5:
+    if abs(int(timestamp) - int(datetime.now().timestamp()) ) > 60 * 5:
         return False
 
     request_body = await request.body()
@@ -661,6 +670,16 @@ def generate_response(
     conversation summarization, and query refinement.
     """
     print(f"Request received: {request.dict()}")
+
+    ########################################################################
+    # LLM-BASED MODERATION CHECK (ADDED CODE)
+    ########################################################################
+    if not llm_moderation_check(request.query):
+        raise HTTPException(
+            status_code=403,
+            detail="Your query is disallowed by the moderation policy."
+        )
+    ########################################################################
 
     # 1) Get or create chat_id
     if request.new_chat:
@@ -945,8 +964,7 @@ def get_user_workspaces(
 @app.post("/configure-storage")
 def configure_storage(
     storage_config: StorageConfig,
-    current_user=Depends(role_required(["superadmin"]))
-):
+    current_user=Depends(role_required(["superadmin"]))):
     config_path = "storage_config.json"
     with open(config_path, "w") as f:
         json.dump(storage_config.dict(), f)
@@ -1104,3 +1122,501 @@ def configure_storage_dashboard(
         json.dump(payload.dict(), f)
 
     return {"message": f"Storage configured successfully for {datalake_type}"}
+
+# ----------------------------------------------------------------------------
+# LLM-BASED MODERATION HELPERS (ADDED CODE)
+# ----------------------------------------------------------------------------
+
+def llm_moderation_check(query: str) -> bool:
+    """
+    Use the LLM to decide if a query is ALLOWED or DISALLOWED based on a simple inline policy.
+    Returns True if allowed, False if disallowed.
+    """
+    # A minimal policy prompt:
+    policy_prompt = f"""
+System: You are a strict content policy checker. The user input is below.
+If the user is discussing or requesting disallowed topics (like politics), respond EXACTLY 'DISALLOWED'.
+Otherwise respond EXACTLY 'ALLOWED'.
+
+User input:
+{query}
+""".strip()
+
+    with llm_lock:
+        classification = llm.invoke(policy_prompt).strip().upper()
+
+    # If the LLM says DISALLOWED, we return False. Otherwise True.
+    if "DISALLOWED" in classification:
+        return False
+    return True
+
+# ----------------------------------------------------------------------------
+# EVALUATION CODE WITH TENSORBOARD
+# ----------------------------------------------------------------------------
+
+class RetrievalEvaluationItem(BaseModel):
+    query: str
+    ground_truth_docs: List[str]
+    retrieved_docs: List[str]
+    ground_truth_answer: Optional[str] = None
+    system_answer: Optional[str] = None
+
+class EvaluationRequest(BaseModel):
+    data: List[RetrievalEvaluationItem]
+
+rouge_metric = evaluate.load("rouge")
+meteor_metric = evaluate.load("meteor")
+bertscore_metric = evaluate.load("bertscore")
+
+def compute_precision_recall_f1(
+    relevant: set,
+    retrieved: set
+):
+    if not relevant and not retrieved:
+        return 1.0, 1.0, 1.0
+    tp = len(relevant.intersection(retrieved))
+    fp = len(retrieved - relevant)
+    fn = len(relevant - retrieved)
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    if precision + recall > 0:
+        f1 = 2 * (precision * recall) / (precision + recall)
+    else:
+        f1 = 0.0
+    return precision, recall, f1
+
+def compute_mrr(relevant_docs: set, retrieved_docs: List[str]) -> float:
+    for idx, doc_id in enumerate(retrieved_docs):
+        if doc_id in relevant_docs:
+            return 1.0 / (idx + 1)
+    return 0.0
+
+def compute_dcg(relevance_list: List[int]) -> float:
+    dcg = 0.0
+    for i, rel in enumerate(relevance_list):
+        if rel > 0:
+            dcg += rel / math.log2(i + 2)
+    return dcg
+
+def compute_ndcg(relevant_docs: set, retrieved_docs: List[str], k: Optional[int] = None) -> float:
+    if not k:
+        k = len(retrieved_docs)
+    truncated = retrieved_docs[:k]
+    rel_list = [1 if doc_id in relevant_docs else 0 for doc_id in truncated]
+    dcg = compute_dcg(rel_list)
+    ideal_rel_list = sorted(rel_list, reverse=True)
+    idcg = compute_dcg(ideal_rel_list)
+    if idcg == 0.0:
+        return 1.0 if dcg == 0.0 else 0.0
+    return dcg / idcg
+
+def compute_text_metrics(predictions: List[str], references: List[str]):
+    rouge_results = rouge_metric.compute(predictions=predictions, references=references)
+    meteor_results = meteor_metric.compute(predictions=predictions, references=references)
+    bert_results = bertscore_metric.compute(
+        predictions=predictions,
+        references=references,
+        model_type="bert-base-uncased"
+    )
+
+    results_summary = {}
+    results_summary["rouge1_f"] = rouge_results["rouge1"]
+    results_summary["rouge2_f"] = rouge_results["rouge2"]
+    results_summary["rougeL_f"] = rouge_results["rougeL"]
+    results_summary["meteor"] = meteor_results["meteor"]
+    results_summary["bertscore_precision"] = sum(bert_results["precision"]) / len(bert_results["precision"])
+    results_summary["bertscore_recall"]    = sum(bert_results["recall"]) / len(bert_results["recall"])
+    results_summary["bertscore_f1"]        = sum(bert_results["f1"]) / len(bert_results["f1"])
+    return results_summary
+
+@app.post("/evaluate")
+def evaluate_system(request_data: EvaluationRequest):
+    """
+    Accepts a list of evaluation items, each containing:
+     - query
+     - ground_truth_docs
+     - retrieved_docs (system-provided)
+     - ground_truth_answer
+
+    For each item, this endpoint:
+      1. Refines the query and retrieves documents.
+      2. Constructs a prompt and generates a new system answer using the LLM.
+      3. Computes retrieval metrics (using the provided retrieved_docs) and
+         generative (text) metrics comparing the new answer with the ground truth.
+      4. Logs all metrics to TensorBoard and returns the aggregated metrics
+         along with the generated answers.
+    """
+    if not TENSORBOARD_AVAILABLE:
+        raise HTTPException(status_code=500, detail="TensorBoard not installed or unavailable.")
+
+    data = request_data.data
+
+    # Create a TensorBoard SummaryWriter (using a timestamped directory)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = f"runs/evaluation_{timestamp}"
+    writer = SummaryWriter(log_dir=log_dir)
+
+    # Initialize accumulators for retrieval metrics
+    sum_precision = 0.0
+    sum_recall = 0.0
+    sum_f1 = 0.0
+    sum_mrr = 0.0
+    sum_ndcg = 0.0
+    retrieval_count = 0
+
+    # For generative metrics (text evaluation)
+    all_predictions = []
+    all_references = []
+    generated_answers = []
+
+    # Process each evaluation item
+    for idx, item in enumerate(data):
+        # --- Retrieval metrics are computed based on provided docs ---
+        relevant_docs = set(item.ground_truth_docs)
+        retrieved_docs = item.retrieved_docs
+        if relevant_docs or retrieved_docs:
+            p, r, f1 = compute_precision_recall_f1(relevant_docs, set(retrieved_docs))
+            mrr = compute_mrr(relevant_docs, retrieved_docs)
+            ndcg = compute_ndcg(relevant_docs, retrieved_docs)
+            sum_precision += p
+            sum_recall += r
+            sum_f1 += f1
+            sum_mrr += mrr
+            sum_ndcg += ndcg
+            retrieval_count += 1
+        else:
+            p = r = f1 = mrr = ndcg = 1.0
+
+        # Log per-item retrieval metrics
+        writer.add_scalar("per_item/precision", p, idx)
+        writer.add_scalar("per_item/recall", r, idx)
+        writer.add_scalar("per_item/f1", f1, idx)
+        writer.add_scalar("per_item/mrr", mrr, idx)
+        writer.add_scalar("per_item/ndcg", ndcg, idx)
+
+        # --- Generate a new system answer ---
+        # Assume an empty conversation context for evaluation.
+        conversation_so_far = ""
+        refined_query = refine_query(item.query, conversation_so_far)
+        docs = get_hybrid_plus_cypher_docs(refined_query, top_k=3, use_cypher_expansion=True)
+
+        # Build a context string from the retrieved documents
+        context_text = ""
+        for doc in docs:
+            piece = f"{doc['content']}\n(Source: {doc['filename']})\n\n"
+            if len(context_text + piece) < MAX_CONTEXT_CHARS:
+                context_text += piece
+            else:
+                context_text += "... [truncated]"
+                break
+
+        # Construct the prompt using the query and context
+        prompt = f"""
+        You are a helpful assistant who provides concise, step-by-step solutions.
+        Conversation so far: {conversation_so_far}
+        Relevant context: {context_text}
+        Question: {item.query}
+        Your concise answer:
+        """.strip()
+
+        # Generate the new system answer using your LLM
+        with llm_lock:
+            generated_answer = llm.invoke(prompt).strip()
+        generated_answer = generated_answer.encode('utf-8', errors='replace').decode('utf-8')
+
+        # Fill the evaluation item with the newly generated answer
+        item.system_answer = generated_answer
+        generated_answers.append(generated_answer)
+
+        # For generative metrics, accumulate ground truth and generated answer
+        if item.ground_truth_answer:
+            all_references.append(item.ground_truth_answer)
+            all_predictions.append(generated_answer)
+
+    # Compute aggregated retrieval metrics
+    if retrieval_count > 0:
+        avg_precision = sum_precision / retrieval_count
+        avg_recall = sum_recall / retrieval_count
+        avg_f1 = sum_f1 / retrieval_count
+        avg_mrr = sum_mrr / retrieval_count
+        avg_ndcg = sum_ndcg / retrieval_count
+    else:
+        avg_precision = avg_recall = avg_f1 = avg_mrr = avg_ndcg = 0.0
+
+    writer.add_scalar("retrieval/precision", avg_precision, 0)
+    writer.add_scalar("retrieval/recall", avg_recall, 0)
+    writer.add_scalar("retrieval/f1", avg_f1, 0)
+    writer.add_scalar("retrieval/mrr", avg_mrr, 0)
+    writer.add_scalar("retrieval/ndcg", avg_ndcg, 0)
+
+    # Compute generative (text) metrics if ground truth answers exist
+    if all_predictions and all_references:
+        generative_metrics = com    pute_text_metrics(all_predictions, all_references)
+        writer.add_scalar("generative/rouge1_f", generative_metrics["rouge1_f"], 0)
+        writer.add_scalar("generative/rouge2_f", generative_metrics["rouge2_f"], 0)
+        writer.add_scalar("generative/rougeL_f", generative_metrics["rougeL_f"], 0)
+        writer.add_scalar("generative/meteor", generative_metrics["meteor"], 0)
+        writer.add_scalar("generative/bertscore_precision", generative_metrics["bertscore_precision"], 0)
+        writer.add_scalar("generative/bertscore_recall", generative_metrics["bertscore_recall"], 0)
+        writer.add_scalar("generative/bertscore_f1", generative_metrics["bertscore_f1"], 0)
+    else:
+        generative_metrics = {
+            "rouge1_f": 0.0,
+            "rouge2_f": 0.0,
+            "rougeL_f": 0.0,
+            "meteor": 0.0,
+            "bertscore_precision": 0.0,
+            "bertscore_recall": 0.0,
+            "bertscore_f1": 0.0
+        }
+
+    writer.close()
+
+    return {
+        "retrieval_metrics": {
+            "precision": avg_precision,
+            "recall": avg_recall,
+            "f1": avg_f1,
+            "mrr": avg_mrr,
+            "ndcg": avg_ndcg
+        },
+        "generative_metrics": generative_metrics,
+        "tensorboard_logdir": log_dir,
+        "generated_system_answers": generated_answers
+    }
+
+# ----------------------------------------------------------------------------
+# ADD THESE FOR YOUR MODERATION CONFIG
+# ----------------------------------------------------------------------------
+
+class ModerationConfig(BaseModel):
+    moderation_policy_prompt: str = ""
+
+@app.get("/admin/moderation-config")
+def get_moderation_config(current_user=Depends(role_required(["superadmin"]))):
+    """
+    Returns JSON with the current moderation policy (prompt) from moderation_config.json.
+    """
+    config_path = "moderation_config.json"
+    if not os.path.exists(config_path):
+        return {"moderation_policy_prompt": ""}
+    with open(config_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data
+
+@app.post("/admin/moderation-config")
+def update_moderation_config(
+    new_config: ModerationConfig,
+    current_user=Depends(role_required(["superadmin"]))
+):
+    """
+    Updates moderation_config.json with new data from superadmin.
+    """
+    config_path = "moderation_config.json"
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(new_config.dict(), f, ensure_ascii=False, indent=2)
+    return {"message": "Moderation config updated successfully."}
+
+
+# ----------------------------------------------------------------------------
+# NEW: API KEY CREATION & LISTING FOR ADMIN/SUPERADMIN
+# ----------------------------------------------------------------------------
+import secrets
+
+class ApiKeyCreateRequest(BaseModel):
+    name: str  # e.g. "Popup Integration" or "Marketing Website"
+    is_global: bool = True
+    workspace_id: Optional[int] = None  # if you want to limit usage to a workspace, set this
+
+@app.post("/admin/api-keys/generate")
+def generate_api_key(
+    req: ApiKeyCreateRequest,
+    current_user=Depends(role_required(["admin", "superadmin"]))
+):
+    """
+    Generates a new random API key for external usage, optionally tied to a workspace or global.
+    Stores it in 'api_keys' table (which you must create in DB).
+    Returns the raw key_value once (make sure to copy it!).
+    """
+
+    # Make a random hex token
+    new_key_value = secrets.token_hex(32)  # e.g. 64-char hex string
+
+    # Insert into a hypothetical 'api_keys' table.
+    # You must create a table in Postgres like:
+    # CREATE TABLE IF NOT EXISTS api_keys (
+    #   id SERIAL PRIMARY KEY,
+    #   name TEXT,
+    #   key_value TEXT UNIQUE,
+    #   is_global BOOLEAN DEFAULT TRUE,
+    #   workspace_id INT,
+    #   created_by INT,
+    #   created_at TIMESTAMP DEFAULT NOW()
+    # );
+    connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO api_keys (name, key_value, is_global, workspace_id, created_by)
+            VALUES (%s, %s, %s, %s, %s) RETURNING id
+            """,
+            (req.name, new_key_value, req.is_global, req.workspace_id, current_user["user_id"])
+        )
+        api_key_id = cursor.fetchone()[0]
+        connection.commit()
+    except Exception as e:
+        cursor.close()
+        connection.close()
+        raise HTTPException(status_code=500, detail=f"Error creating API key: {e}")
+    finally:
+        cursor.close()
+        connection.close()
+
+    return {
+        "api_key_id": api_key_id,
+        "api_key_value": new_key_value,
+        "is_global": req.is_global,
+        "workspace_id": req.workspace_id,
+        "message": "API Key generated successfully. Please copy the api_key_value now, as it won't be shown again."
+    }
+
+@app.get("/admin/api-keys")
+def list_api_keys(current_user=Depends(role_required(["admin", "superadmin"]))):
+    """
+    Lists existing API keys from the 'api_keys' table.
+    - If role == 'superadmin', show all keys.
+    - If role == 'admin', show only keys created_by this user.
+    For security reasons, consider hiding the raw key_value in production.
+    """
+    connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
+    cursor = connection.cursor()
+    try:
+        # If superadmin, see all keys
+        if current_user["role"] == "superadmin":
+            query = """
+                SELECT id, name, key_value, is_global, workspace_id, created_by, created_at
+                FROM api_keys
+                ORDER BY id ASC
+            """
+            cursor.execute(query)
+        else:
+            # Admin: see only your own keys
+            query = """
+                SELECT id, name, key_value, is_global, workspace_id, created_by, created_at
+                FROM api_keys
+                WHERE created_by = %s
+                ORDER BY id ASC
+            """
+            cursor.execute(query, (current_user["user_id"],))
+
+        rows = cursor.fetchall()
+        result = []
+        for r in rows:
+            result.append({
+                "id": r[0],
+                "name": r[1],
+                "key_value": r[2],
+                "is_global": r[3],
+                "workspace_id": r[4],
+                "created_by": r[5],
+                "created_at": str(r[6])
+            })
+        return {"api_keys": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        connection.close()
+from fastapi import Header
+
+@app.post("/external-chat", response_model=ChatResponse)
+def external_chat(
+    request: QueryRequest,
+    x_api_key: str = Header(None)
+):
+    """
+    Minimal external endpoint that reuses the /chat logic.
+    1) We validate the API key from 'api_keys' table.
+    2) If valid, we pass a 'fake' user object with user_id=0 into the existing /chat function.
+    3) The /chat logic is reused exactly.
+    """
+
+    # 1) Check if x_api_key is present
+    if not x_api_key:
+        raise HTTPException(status_code=403, detail="Missing X-Api-Key header.")
+
+    # 2) Validate the API key from your database
+    connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
+    cursor = connection.cursor()
+    try:
+        cursor.execute("""
+            SELECT id, is_global, workspace_id
+            FROM api_keys
+            WHERE key_value = %s
+            LIMIT 1
+        """, (x_api_key,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=403, detail="Invalid or unknown API key.")
+
+        # If you want to enforce is_global/workspace here, do so
+        # e.g. is_global = row[1], workspace_id = row[2]
+    except Exception as e:
+        cursor.close()
+        connection.close()
+        raise HTTPException(status_code=500, detail=f"Error checking API key: {e}")
+    finally:
+        cursor.close()
+        connection.close()
+
+    # 3) Create a "fake" user dict with user_id=0, so the /chat logic sees "someone"
+    #    You can pick any role that passes your internal checks. Typically "admin" or "superadmin."
+    fake_user = {"user_id": 0, "role": "user", "workspace_id": None}
+
+    # 4) Reuse the existing generate_response(...) function
+    #    because it takes (request, current_user=...).
+    #    The "Depends(get_current_user_with_role)" will be skipped when we call it directly.
+    return generate_response(request, fake_user)
+
+@app.delete("/admin/api-keys/{id}/revoke")
+def revoke_api_key(
+    id: int,
+    current_user=Depends(role_required(["admin", "superadmin"]))
+):
+    """
+    Revokes (deletes) the API key with the given ID from the api_keys table.
+    - If role == 'superadmin', can revoke any key.
+    - If role == 'admin', can only revoke keys they created themselves.
+    """
+    connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
+    cursor = connection.cursor()
+    try:
+        # 1) Check if the key exists
+        cursor.execute("""
+            SELECT id, created_by
+            FROM api_keys
+            WHERE id = %s
+        """, (id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="API key not found")
+
+        key_id, created_by = row
+
+        # 2) If the current user is 'admin', ensure they own this key
+        if current_user["role"] == "admin" and created_by != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="You do not have permission to revoke this key")
+
+        # 3) Perform the delete
+        cursor.execute("DELETE FROM api_keys WHERE id = %s", (key_id,))
+        connection.commit()
+
+        return {"message": f"API key {id} revoked successfully"}
+    except Exception as e:
+        connection.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        connection.close()
