@@ -38,7 +38,8 @@ class ApiService {
     final response = await http.post(
       Uri.parse('$baseUrl/login'),
       headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body: 'username=${Uri.encodeQueryComponent(username)}&password=${Uri.encodeQueryComponent(password)}',
+      body:
+      'username=${Uri.encodeQueryComponent(username)}&password=${Uri.encodeQueryComponent(password)}',
     );
 
     if (response.statusCode == 200) {
@@ -57,7 +58,8 @@ class ApiService {
     final response = await http.post(
       Uri.parse('$baseUrl/register'),
       headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body: 'username=${Uri.encodeQueryComponent(username)}&password=${Uri.encodeQueryComponent(password)}',
+      body:
+      'username=${Uri.encodeQueryComponent(username)}&password=${Uri.encodeQueryComponent(password)}',
     );
 
     if (response.statusCode == 200) {
@@ -90,7 +92,8 @@ class ApiService {
     }
   }
 
-  Future<Map<String, dynamic>> chat(String query, {required bool newChat, String? chatId}) async {
+  Future<Map<String, dynamic>> chat(String query,
+      {required bool newChat, String? chatId}) async {
     final body = {'query': query, 'new_chat': newChat};
     if (chatId != null) body['chat_id'] = chatId;
 
@@ -367,6 +370,96 @@ class ApiService {
     } else {
       final errorData = json.decode(utf8.decode(response.bodyBytes));
       throw Exception(errorData['detail'] ?? 'Failed to upload file to local datalake.');
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // LLM Moderation Config
+  // -------------------------------------------------------------------------
+  Future<Map<String, dynamic>> getModerationConfig() async {
+    final response = await http.get(
+      Uri.parse('$baseUrl/admin/moderation-config'),
+      headers: authHeaders,
+    );
+    if (response.statusCode == 200) {
+      return jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, dynamic>;
+    } else {
+      final errorData = json.decode(utf8.decode(response.bodyBytes));
+      throw Exception(errorData['detail'] ?? 'Failed to fetch moderation config');
+    }
+  }
+
+  Future<Map<String, dynamic>> updateModerationConfig(Map<String, dynamic> newConfig) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/admin/moderation-config'),
+      headers: {
+        ...authHeaders,
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode(newConfig),
+    );
+    if (response.statusCode == 200) {
+      return jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, dynamic>;
+    } else {
+      final errorData = json.decode(utf8.decode(response.bodyBytes));
+      throw Exception(errorData['detail'] ?? 'Failed to update moderation config');
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // API Key Management
+  // -------------------------------------------------------------------------
+  Future<Map<String, dynamic>> generateApiKey(String name, bool isGlobal, {int? workspaceId}) async {
+    final uri = Uri.parse('$baseUrl/admin/api-keys/generate');
+    final payload = {
+      "name": name,
+      "is_global": isGlobal,
+    };
+    if (workspaceId != null) {
+      payload["workspace_id"] = workspaceId;
+    }
+
+    final response = await http.post(
+      uri,
+      headers: {
+        ...authHeaders,
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode(payload),
+    );
+
+    if (response.statusCode == 200) {
+      return json.decode(utf8.decode(response.bodyBytes)) as Map<String, dynamic>;
+    } else {
+      final errorData = json.decode(utf8.decode(response.bodyBytes));
+      throw Exception(errorData['detail'] ?? 'Failed to generate API key');
+    }
+  }
+
+  Future<List<dynamic>> listApiKeys() async {
+    final uri = Uri.parse('$baseUrl/admin/api-keys');
+    final response = await http.get(uri, headers: authHeaders);
+    if (response.statusCode == 200) {
+      final data = json.decode(utf8.decode(response.bodyBytes));
+      return data['api_keys'] ?? [];
+    } else {
+      final errorData = json.decode(utf8.decode(response.bodyBytes));
+      throw Exception(errorData['detail'] ?? 'Failed to list API keys');
+    }
+  }
+
+  /// Revoke (delete) an API key, given its integer `apiKeyId`.
+  /// Adjust the endpoint path if your server uses a different route.
+  Future<void> revokeApiKey(int apiKeyId) async {
+    final uri = Uri.parse('$baseUrl/admin/api-keys/$apiKeyId');
+    final response = await http.delete(
+      uri,
+      headers: authHeaders,
+    );
+
+    if (response.statusCode != 200 && response.statusCode != 204) {
+      final errorData = json.decode(utf8.decode(response.bodyBytes));
+      throw Exception(errorData['detail'] ?? 'Failed to revoke API key');
     }
   }
 }

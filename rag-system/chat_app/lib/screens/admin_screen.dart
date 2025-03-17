@@ -21,21 +21,39 @@ class _AdminScreenState extends State<AdminScreen> {
   final TextEditingController newUsernameController = TextEditingController();
   final TextEditingController newPasswordController = TextEditingController();
 
-  // NEW: For Google Drive and storage config
+  // For Google Drive and storage config
   final TextEditingController gdriveFolderIdController = TextEditingController();
-  String selectedDatalakeType = "local"; // default
-  bool isGlobal = false;                // for the "Copy" step
+  String selectedDatalakeType = "local";
+  bool isGlobal = false;
 
-  // NEW: For the local datalake upload (optional workspace ID)
+  // For the local datalake upload (optional workspace ID)
   final TextEditingController localDatalakeWorkspaceIdController = TextEditingController();
 
   // Variables
   String selectedRole = "user";
   String selectedScope = "chat";
-  String statusMessage = "";
   List<dynamic> allUsers = [];
   Map<int, List<dynamic>> userWorkspacesMap = {};
   Map<int, List<dynamic>> userChatsMap = {};
+
+  // Moderation Policy
+  final TextEditingController moderationPolicyController = TextEditingController();
+
+  // Localized info messages
+  String workspaceCardMessage = "";
+  String assignUserCardMessage = "";
+  String userCardMessage = "";
+  String embedDocsCardMessage = "";
+  String storageCardMessage = "";
+  String localDatalakeCardMessage = "";
+  String moderationCardMessage = "";
+  String apiKeysCardMessage = "";
+
+  // API Key Management
+  final TextEditingController apiKeyNameController = TextEditingController();
+  final TextEditingController apiKeyWorkspaceController = TextEditingController();
+  bool apiKeyIsGlobal = true;
+  List<dynamic> apiKeys = [];
 
   @override
   void initState() {
@@ -53,7 +71,7 @@ class _AdminScreenState extends State<AdminScreen> {
         });
       } catch (e) {
         setState(() {
-          statusMessage = "Error loading users: $e";
+          userCardMessage = "Error loading users: $e";
         });
       }
     }
@@ -67,7 +85,7 @@ class _AdminScreenState extends State<AdminScreen> {
       });
     } catch (e) {
       setState(() {
-        statusMessage = "Error fetching workspaces: $e";
+        userCardMessage = "Error fetching workspaces: $e";
       });
     }
   }
@@ -80,7 +98,7 @@ class _AdminScreenState extends State<AdminScreen> {
       });
     } catch (e) {
       setState(() {
-        statusMessage = "Error loading user chats: $e";
+        userCardMessage = "Error loading user chats: $e";
       });
     }
   }
@@ -91,12 +109,12 @@ class _AdminScreenState extends State<AdminScreen> {
       int userId = int.parse(assignUserIdController.text.trim());
       await apiService.assignUserToWorkspace(workspaceId, userId);
       setState(() {
-        statusMessage = "Assigned user $userId to workspace $workspaceId";
+        assignUserCardMessage = "Assigned user $userId to workspace $workspaceId";
       });
       await fetchUserWorkspaces(userId);
     } catch (e) {
       setState(() {
-        statusMessage = "Error assigning user: $e";
+        assignUserCardMessage = "Error assigning user: $e";
       });
     }
   }
@@ -108,13 +126,13 @@ class _AdminScreenState extends State<AdminScreen> {
     try {
       await apiService.changeUsername(userId, newUsername);
       setState(() {
-        statusMessage = "Username changed successfully for user $userId";
+        userCardMessage = "Username changed successfully for user $userId";
       });
       await loadUsersIfSuperAdmin();
       newUsernameController.clear();
     } catch (e) {
       setState(() {
-        statusMessage = "Error changing username: $e";
+        userCardMessage = "Error changing username: $e";
       });
     }
   }
@@ -126,12 +144,12 @@ class _AdminScreenState extends State<AdminScreen> {
     try {
       await apiService.changePassword(userId, newPassword);
       setState(() {
-        statusMessage = "Password changed successfully for user $userId";
+        userCardMessage = "Password changed successfully for user $userId";
       });
       newPasswordController.clear();
     } catch (e) {
       setState(() {
-        statusMessage = "Error changing password: $e";
+        userCardMessage = "Error changing password: $e";
       });
     }
   }
@@ -140,38 +158,36 @@ class _AdminScreenState extends State<AdminScreen> {
     try {
       final result = await apiService.createWorkspace(workspaceNameController.text.trim());
       setState(() {
-        statusMessage = "Workspace created: ${result['workspace_id']}";
+        workspaceCardMessage = "Workspace created: ${result['workspace_id']}";
       });
     } catch (e) {
       setState(() {
-        statusMessage = "Error creating workspace: $e";
+        workspaceCardMessage = "Error creating workspace: $e";
       });
     }
   }
 
-  // Existing "uploadDocument" for /documents
   Future<void> uploadDocument() async {
     try {
       if (filePathController.text.isEmpty) {
         setState(() {
-          statusMessage = "No file selected";
+          embedDocsCardMessage = "No file selected";
         });
         return;
       }
       final response = await apiService.uploadDocument(filePathController.text, selectedScope);
       setState(() {
-        statusMessage = "Document uploaded successfully: ${response['message']}";
+        embedDocsCardMessage = "Document uploaded successfully: ${response['message']}";
       });
     } catch (e) {
       setState(() {
-        statusMessage = "Error uploading document: $e";
+        embedDocsCardMessage = "Error uploading document: $e";
       });
     }
   }
 
-  // Existing pickFile
   Future<void> pickFile() async {
-    FilePickerResult? result = await FilePicker.platform.pickFiles();
+    final result = await FilePicker.platform.pickFiles();
     if (result != null) {
       filePathController.text = result.files.single.path ?? "";
     }
@@ -181,62 +197,59 @@ class _AdminScreenState extends State<AdminScreen> {
     final directory = embedDirectoryController.text.trim();
     if (directory.isEmpty) {
       setState(() {
-        statusMessage = "Directory path cannot be empty.";
+        embedDocsCardMessage = "Directory path cannot be empty.";
       });
       return;
     }
     try {
       await apiService.embedDocuments(directory);
       setState(() {
-        statusMessage = "Documents embedded successfully from $directory.";
+        embedDocsCardMessage = "Documents embedded successfully from $directory.";
       });
     } catch (e) {
       setState(() {
-        statusMessage = "Error embedding documents: $e";
+        embedDocsCardMessage = "Error embedding documents: $e";
       });
     }
   }
 
-  // Copy from GDrive to Local
   Future<void> copyFromGDriveToLocal() async {
     final folderId = gdriveFolderIdController.text.trim();
     if (folderId.isEmpty) {
       setState(() {
-        statusMessage = "Folder ID cannot be empty.";
+        storageCardMessage = "Folder ID cannot be empty.";
       });
       return;
     }
     try {
       final result = await apiService.copyGoogleDriveToLocal(folderId, isGlobal);
       setState(() {
-        statusMessage = result["message"];
+        storageCardMessage = result["message"];
       });
     } catch (e) {
       setState(() {
-        statusMessage = "Error copying from Google Drive: $e";
+        storageCardMessage = "Error copying from Google Drive: $e";
       });
     }
   }
 
-  // Configure Storage
   Future<void> doConfigureStorage() async {
     try {
       final result = await apiService.configureStorageDashboard(selectedDatalakeType);
       setState(() {
-        statusMessage = result["message"];
+        storageCardMessage = result["message"];
       });
     } catch (e) {
       setState(() {
-        statusMessage = "Error configuring storage: $e";
+        storageCardMessage = "Error configuring storage: $e";
       });
     }
   }
 
-  // NEW: Upload & Embed file to local datalake
   Future<void> uploadFileToLocalDatalake() async {
     if (filePathController.text.isEmpty) {
       setState(() {
-        statusMessage = "No file selected for local datalake upload.";
+        localDatalakeCardMessage = "No file selected for local datalake upload.";
       });
       return;
     }
@@ -253,11 +266,98 @@ class _AdminScreenState extends State<AdminScreen> {
         workspaceId: workspaceId,
       );
       setState(() {
-        statusMessage = "Local datalake upload success: ${result['message']}";
+        localDatalakeCardMessage = "Local datalake upload success: ${result['message']}";
       });
     } catch (e) {
       setState(() {
-        statusMessage = "Error uploading file to local datalake: $e";
+        localDatalakeCardMessage = "Error uploading file to local datalake: $e";
+      });
+    }
+  }
+
+  Future<void> fetchModerationPolicy() async {
+    try {
+      final config = await apiService.getModerationConfig();
+      final prompt = config['moderation_policy_prompt'] ?? '';
+      moderationPolicyController.text = prompt;
+      setState(() {
+        moderationCardMessage = "Moderation policy loaded.";
+      });
+    } catch (e) {
+      setState(() {
+        moderationCardMessage = "Error fetching moderation policy: $e";
+      });
+    }
+  }
+
+  Future<void> saveModerationPolicy() async {
+    try {
+      final newConfig = {
+        "moderation_policy_prompt": moderationPolicyController.text.trim(),
+      };
+      await apiService.updateModerationConfig(newConfig);
+      setState(() {
+        moderationCardMessage = "Moderation policy updated successfully.";
+      });
+    } catch (e) {
+      setState(() {
+        moderationCardMessage = "Error saving moderation policy: $e";
+      });
+    }
+  }
+
+  // API Key Management
+  Future<void> generateApiKey() async {
+    final name = apiKeyNameController.text.trim();
+    if (name.isEmpty) {
+      setState(() {
+        apiKeysCardMessage = "API Key name cannot be empty.";
+      });
+      return;
+    }
+
+    int? wsId;
+    if (apiKeyWorkspaceController.text.trim().isNotEmpty) {
+      wsId = int.tryParse(apiKeyWorkspaceController.text.trim());
+    }
+
+    try {
+      final result = await apiService.generateApiKey(name, apiKeyIsGlobal, workspaceId: wsId);
+      setState(() {
+        apiKeysCardMessage = "API Key generated: ${result['api_key_value']}";
+      });
+    } catch (e) {
+      setState(() {
+        apiKeysCardMessage = "Error generating API key: $e";
+      });
+    }
+  }
+
+  Future<void> listApiKeys() async {
+    try {
+      final keys = await apiService.listApiKeys();
+      setState(() {
+        apiKeys = keys;
+      });
+    } catch (e) {
+      setState(() {
+        apiKeysCardMessage = "Error listing API keys: $e";
+      });
+    }
+  }
+
+  /// Revoke a single API key by ID
+  Future<void> revokeApiKey(int keyId) async {
+    try {
+      await apiService.revokeApiKey(keyId);
+      setState(() {
+        apiKeysCardMessage = "API Key $keyId revoked successfully.";
+      });
+      // Refresh the list so it no longer shows the revoked key
+      await listApiKeys();
+    } catch (e) {
+      setState(() {
+        apiKeysCardMessage = "Error revoking API key: $e";
       });
     }
   }
@@ -281,19 +381,21 @@ class _AdminScreenState extends State<AdminScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            if (statusMessage.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 20),
-                child: Text(statusMessage, style: TextStyle(fontSize: 16, color: Colors.blue)),
-              ),
 
-            // Workspace Management
+            //------------------------------------------------------------------
+            // Manage Workspaces Card
+            //------------------------------------------------------------------
             Card(
               child: Padding(
                 padding: EdgeInsets.all(16),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
+                    if (workspaceCardMessage.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 10),
+                        child: Text(workspaceCardMessage, style: TextStyle(color: Colors.blue)),
+                      ),
                     Text("Manage Workspaces", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
                     SizedBox(height: 10),
                     TextField(
@@ -309,7 +411,13 @@ class _AdminScreenState extends State<AdminScreen> {
                       style: ElevatedButton.styleFrom(backgroundColor: Colors.pink),
                       child: Text("Create Workspace"),
                     ),
+
                     SizedBox(height: 20),
+                    if (assignUserCardMessage.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 10),
+                        child: Text(assignUserCardMessage, style: TextStyle(color: Colors.blue)),
+                      ),
                     Text("Assign User to Workspace", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
                     SizedBox(height: 10),
                     TextField(
@@ -340,7 +448,9 @@ class _AdminScreenState extends State<AdminScreen> {
               ),
             ),
 
-            // User Management
+            //------------------------------------------------------------------
+            // User Management (superadmin)
+            //------------------------------------------------------------------
             if (role == "superadmin" && allUsers.isNotEmpty)
               Card(
                 child: Padding(
@@ -348,6 +458,11 @@ class _AdminScreenState extends State<AdminScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
+                      if (userCardMessage.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 10),
+                          child: Text(userCardMessage, style: TextStyle(color: Colors.blue)),
+                        ),
                       Text("All Users", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
                       SizedBox(height: 10),
                       for (var user in allUsers) ...[
@@ -375,8 +490,9 @@ class _AdminScreenState extends State<AdminScreen> {
                                                 ),
                                                 actions: [
                                                   TextButton(
-                                                      onPressed: () => Navigator.pop(context),
-                                                      child: Text("Cancel")),
+                                                    onPressed: () => Navigator.pop(context),
+                                                    child: Text("Cancel"),
+                                                  ),
                                                   ElevatedButton(
                                                     onPressed: () {
                                                       Navigator.pop(context);
@@ -386,7 +502,8 @@ class _AdminScreenState extends State<AdminScreen> {
                                                   )
                                                 ],
                                               );
-                                            });
+                                            }
+                                        );
                                       },
                                       style: ElevatedButton.styleFrom(backgroundColor: Colors.blue),
                                       child: Text("Change Username"),
@@ -406,8 +523,9 @@ class _AdminScreenState extends State<AdminScreen> {
                                                 ),
                                                 actions: [
                                                   TextButton(
-                                                      onPressed: () => Navigator.pop(context),
-                                                      child: Text("Cancel")),
+                                                    onPressed: () => Navigator.pop(context),
+                                                    child: Text("Cancel"),
+                                                  ),
                                                   ElevatedButton(
                                                     onPressed: () {
                                                       Navigator.pop(context);
@@ -417,16 +535,15 @@ class _AdminScreenState extends State<AdminScreen> {
                                                   )
                                                 ],
                                               );
-                                            });
+                                            }
+                                        );
                                       },
                                       style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
                                       child: Text("Change Password"),
                                     ),
                                     SizedBox(width: 10),
                                     ElevatedButton(
-                                      onPressed: () {
-                                        fetchUserChats(user['id']);
-                                      },
+                                      onPressed: () => fetchUserChats(user['id']),
                                       style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
                                       child: Text("View Chats"),
                                     ),
@@ -454,7 +571,9 @@ class _AdminScreenState extends State<AdminScreen> {
                 ),
               ),
 
+            //------------------------------------------------------------------
             // Embed Documents
+            //------------------------------------------------------------------
             if (role == "superadmin")
               Card(
                 child: Padding(
@@ -462,6 +581,11 @@ class _AdminScreenState extends State<AdminScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
+                      if (embedDocsCardMessage.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 10),
+                          child: Text(embedDocsCardMessage, style: TextStyle(color: Colors.blue)),
+                        ),
                       Text("Embed Documents", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
                       SizedBox(height: 10),
                       TextField(
@@ -477,12 +601,15 @@ class _AdminScreenState extends State<AdminScreen> {
                         style: ElevatedButton.styleFrom(backgroundColor: Colors.pink),
                         child: Text("Start Embedding"),
                       ),
+                      SizedBox(height: 10),
                     ],
                   ),
                 ),
               ),
 
+            //------------------------------------------------------------------
             // STORAGE INTEGRATION CARD
+            //------------------------------------------------------------------
             if (role == "superadmin")
               Card(
                 child: Padding(
@@ -490,6 +617,11 @@ class _AdminScreenState extends State<AdminScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
+                      if (storageCardMessage.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 10),
+                          child: Text(storageCardMessage, style: TextStyle(color: Colors.blue)),
+                        ),
                       Text(
                         "Storage Integration Settings",
                         style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
@@ -557,9 +689,9 @@ class _AdminScreenState extends State<AdminScreen> {
                 ),
               ),
 
-            // -----------------------------------
-            // NEW CARD: Upload & Embed into Local Datalake
-            // -----------------------------------
+            //------------------------------------------------------------------
+            // Upload & Embed into Local Datalake
+            //------------------------------------------------------------------
             if (role == "superadmin" || role == "admin")
               Card(
                 child: Padding(
@@ -567,6 +699,11 @@ class _AdminScreenState extends State<AdminScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
+                      if (localDatalakeCardMessage.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 10),
+                          child: Text(localDatalakeCardMessage, style: TextStyle(color: Colors.blue)),
+                        ),
                       Text(
                         "Upload & Embed File to Local Datalake",
                         style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
@@ -623,6 +760,153 @@ class _AdminScreenState extends State<AdminScreen> {
                         style: ElevatedButton.styleFrom(backgroundColor: Colors.pink),
                         child: Text("Upload & Embed"),
                       ),
+                    ],
+                  ),
+                ),
+              ),
+
+            //------------------------------------------------------------------
+            // Moderation Settings (superadmin)
+            //------------------------------------------------------------------
+            if (role == "superadmin")
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      if (moderationCardMessage.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 10),
+                          child: Text(moderationCardMessage, style: TextStyle(color: Colors.blue)),
+                        ),
+                      Text(
+                        "Moderation Settings",
+                        style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                      ),
+                      SizedBox(height: 10),
+                      TextField(
+                        controller: moderationPolicyController,
+                        maxLines: 6,
+                        decoration: InputDecoration(
+                          labelText: "LLM Moderation Policy Prompt",
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      SizedBox(height: 10),
+                      Row(
+                        children: [
+                          ElevatedButton(
+                            onPressed: fetchModerationPolicy,
+                            style: ElevatedButton.styleFrom(backgroundColor: Colors.blueGrey),
+                            child: Text("Load Policy"),
+                          ),
+                          SizedBox(width: 10),
+                          ElevatedButton(
+                            onPressed: saveModerationPolicy,
+                            style: ElevatedButton.styleFrom(backgroundColor: Colors.pink),
+                            child: Text("Save Policy"),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+
+            //------------------------------------------------------------------
+            // API Key Management
+            //------------------------------------------------------------------
+            if (role == "admin" || role == "superadmin")
+              Card(
+                child: Padding(
+                  padding: EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      if (apiKeysCardMessage.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 10),
+                          child: Text(apiKeysCardMessage, style: TextStyle(color: Colors.blue)),
+                        ),
+                      Text(
+                        "API Key Management",
+                        style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                      ),
+                      SizedBox(height: 10),
+                      TextField(
+                        controller: apiKeyNameController,
+                        decoration: InputDecoration(
+                          labelText: "API Key Name",
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      SizedBox(height: 10),
+                      Row(
+                        children: [
+                          Text("is_global?"),
+                          Switch(
+                            value: apiKeyIsGlobal,
+                            onChanged: (val) {
+                              setState(() {
+                                apiKeyIsGlobal = val;
+                              });
+                            },
+                          ),
+                        ],
+                      ),
+                      SizedBox(height: 10),
+                      TextField(
+                        controller: apiKeyWorkspaceController,
+                        decoration: InputDecoration(
+                          labelText: "Workspace ID (optional)",
+                          border: OutlineInputBorder(),
+                        ),
+                        keyboardType: TextInputType.number,
+                      ),
+                      SizedBox(height: 10),
+                      Row(
+                        children: [
+                          ElevatedButton(
+                            onPressed: generateApiKey,
+                            style: ElevatedButton.styleFrom(backgroundColor: Colors.pink),
+                            child: Text("Generate API Key"),
+                          ),
+                          SizedBox(width: 10),
+                          ElevatedButton(
+                            onPressed: listApiKeys,
+                            style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
+                            child: Text("List API Keys"),
+                          ),
+                        ],
+                      ),
+                      SizedBox(height: 20),
+                      if (apiKeys.isNotEmpty)
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text("Your API Keys:", style: TextStyle(fontWeight: FontWeight.bold)),
+                            for (var k in apiKeys) ...[
+                              Row(
+                                children: [
+                                  // Display key info
+                                  Expanded(
+                                    child: Text(
+                                      "ID: ${k['id']}, Name: ${k['name']}, is_global: ${k['is_global']}, Key: ${k['key_value']}",
+                                    ),
+                                  ),
+                                  SizedBox(width: 10),
+                                  ElevatedButton(
+                                    onPressed: () => revokeApiKey(k['id']),
+                                    style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                                    child: Text("Revoke"),
+                                  ),
+                                ],
+                              ),
+                              SizedBox(height: 5),
+                            ],
+                          ],
+                        ),
                     ],
                   ),
                 ),
